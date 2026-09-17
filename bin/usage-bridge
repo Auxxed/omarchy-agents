@@ -1,0 +1,311 @@
+#!/usr/bin/python3 -I
+"""Bounded list/read/write for agent usage records and optional sync snapshots.
+
+Invoked as an argv array from QML. Never follows the final pathname: every
+open is O_NOFOLLOW|O_NONBLOCK on a descriptor, then fstat, then a cap+1 read.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import stat
+import sys
+from typing import Any
+
+MAX_RECORD = 262144
+MAX_LIST = 32
+MAX_SYNC_FILES = 32
+MAX_NAME = 64
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+MAX_STR = 240
+MAX_LIMITS = 8
+MAX_DAYS = 7
+MAX_MODELS = 16
+
+
+def fail(code: int, msg: str) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def home_dir() -> str:
+    home = os.path.expanduser("~")
+    if not home or home == "/":
+        fail(2, "untrusted home")
+    return home
+
+
+def open_dir_chain(parts: list[str], *, create: bool = False) -> int:
+    fd = os.open(home_dir(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for name in parts:
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", name) or name in (".", ".."):
+                raise PermissionError(f"bad dir component {name}")
+            try:
+                nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(name, 0o700, dir_fd=fd)
+                nfd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+            st = os.fstat(fd)
+            if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+                raise PermissionError(f"untrusted directory {name}")
+        st = os.fstat(fd)
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def usage_dirfd(*, create: bool = False) -> int:
+    return open_dir_chain([".local", "state", "omarchy", "agents", "usage"], create=create)
+
+
+def read_bounded(dirfd: int, name: str, max_bytes: int) -> bytes | None:
+    if not ID_RE.fullmatch(name) or name in (".", ".."):
+        fail(2, "bad name")
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dirfd)
+    except FileNotFoundError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
+            raise PermissionError("refusing file")
+        if st.st_size > max_bytes:
+            raise PermissionError("file too large")
+        os.set_blocking(fd, True)
+        data = b""
+        while len(data) <= max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > max_bytes:
+            raise PermissionError("file grew past the limit")
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_atomic(dirfd: int, name: str, data: bytes) -> None:
+    if not ID_RE.fullmatch(name) or name in (".", ".."):
+        fail(2, "bad name")
+    if len(data) > MAX_RECORD:
+        fail(3, "payload too large")
+    import secrets
+
+    tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dirfd)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fsync(fd)
+        os.rename(tmp, name, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        os.fsync(dirfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def clip_str(value: Any, n: int = MAX_STR) -> str:
+    s = str(value or "")
+    if len(s) > n:
+        s = s[:n]
+    return s
+
+
+def clip_num(value: Any) -> int:
+    try:
+        n = float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if n != n or n < 0:
+        return 0
+    return min(10**12, round(n))
+
+
+def sanitize_record(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    rid = clip_str(raw.get("id"), MAX_NAME)
+    if not ID_RE.fullmatch(rid):
+        return None
+    limits_in = raw.get("limits") if isinstance(raw.get("limits"), list) else []
+    limits = []
+    for entry in limits_in[:MAX_LIMITS]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            percent = float(entry.get("percent"))
+        except (TypeError, ValueError):
+            continue
+        if percent != percent or percent < 0:
+            continue
+        limits.append({
+            "label": clip_str(entry.get("label"), 80),
+            "title": clip_str(entry.get("title"), 80),
+            "percent": min(1.0, percent),
+            "resetsAt": clip_str(entry.get("resetsAt"), 40),
+        })
+    recent = []
+    days = raw.get("recentDays") if isinstance(raw.get("recentDays"), list) else []
+    for day in days[:MAX_DAYS]:
+        if not isinstance(day, dict):
+            continue
+        recent.append({"date": clip_str(day.get("date"), 16), "messageCount": clip_num(day.get("messageCount"))})
+    models = {}
+    usage = raw.get("modelUsage") if isinstance(raw.get("modelUsage"), dict) else {}
+    for i, (key, bucket) in enumerate(usage.items()):
+        if i >= MAX_MODELS or not isinstance(bucket, dict):
+            break
+        mk = clip_str(key, 80)
+        if not mk:
+            continue
+        models[mk] = {
+            "inputTokens": clip_num(bucket.get("inputTokens")),
+            "outputTokens": clip_num(bucket.get("outputTokens")),
+            "cacheReadInputTokens": clip_num(bucket.get("cacheReadInputTokens")),
+            "cacheCreationInputTokens": clip_num(bucket.get("cacheCreationInputTokens")),
+        }
+    today_models = {}
+    src = raw.get("todayTokensByModel") if isinstance(raw.get("todayTokensByModel"), dict) else {}
+    for i, (key, value) in enumerate(src.items()):
+        if i >= MAX_MODELS:
+            break
+        today_models[clip_str(key, 80)] = clip_num(value)
+    balance = None
+    raw_bal = raw.get("balance")
+    if isinstance(raw_bal, dict):
+        remaining = float(raw_bal.get("remaining") or 0)
+        funded = float(raw_bal.get("funded") or 0)
+        if remaining == remaining and remaining >= 0:
+            balance = {
+                "remaining": remaining,
+                "funded": funded if funded == funded and funded >= 0 else 0,
+                "spent": float(raw_bal.get("spent") or 0) if isinstance(raw_bal.get("spent"), (int, float)) else 0,
+                "currency": clip_str(raw_bal.get("currency") or "USD", 8),
+                "estimated": raw_bal.get("estimated") is True,
+            }
+    out = {
+        "schemaVersion": 1,
+        "id": rid,
+        "name": clip_str(raw.get("name") or rid, 80),
+        "ready": raw.get("ready") is True,
+        "hasLocalStats": raw.get("hasLocalStats") is not False,
+        "hasPromptStats": raw.get("hasPromptStats") is not False,
+        "tierLabel": clip_str(raw.get("tierLabel"), 40),
+        "usageStatusText": clip_str(raw.get("usageStatusText"), 120),
+        "authHelpText": clip_str(raw.get("authHelpText"), 200),
+        "limits": limits,
+        "todayPrompts": clip_num(raw.get("todayPrompts")),
+        "todaySessions": clip_num(raw.get("todaySessions")),
+        "todayTotalTokens": clip_num(raw.get("todayTotalTokens")),
+        "todayTokensByModel": today_models,
+        "recentDays": recent,
+        "totalPrompts": clip_num(raw.get("totalPrompts")),
+        "totalSessions": clip_num(raw.get("totalSessions")),
+        "activeDays": clip_num(raw.get("activeDays")),
+        "activeDates": [clip_str(d, 16) for d in (raw.get("activeDates") or [])[:366] if isinstance(d, str)],
+        "modelUsage": models,
+        "retryAdvised": raw.get("retryAdvised") is True,
+        "scope": clip_str(raw.get("scope") or "device", 16),
+    }
+    if balance is not None:
+        out["balance"] = balance
+    return out
+
+
+def cmd_list() -> None:
+    try:
+        dirfd = usage_dirfd(create=False)
+    except FileNotFoundError:
+        return
+    try:
+        ids = []
+        with os.scandir(dirfd) as entries:
+            for entry in entries:
+                if len(ids) >= MAX_LIST:
+                    break
+                name = entry.name
+                if not name.endswith(".json"):
+                    continue
+                stem = name[:-5]
+                if not ID_RE.fullmatch(stem):
+                    continue
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode):
+                    continue
+                ids.append(stem)
+        for stem in sorted(ids):
+            sys.stdout.write(stem + "\n")
+    finally:
+        os.close(dirfd)
+
+
+def cmd_read(agent_id: str) -> None:
+    if not ID_RE.fullmatch(agent_id):
+        fail(2, "bad id")
+    dirfd = usage_dirfd(create=False)
+    try:
+        raw = read_bounded(dirfd, agent_id + ".json", MAX_RECORD)
+    except FileNotFoundError:
+        raise SystemExit(0)
+    finally:
+        os.close(dirfd)
+    if raw is None:
+        return
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        fail(4, "invalid json")
+    record = sanitize_record(parsed)
+    if record is None:
+        fail(4, "invalid record")
+    sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def cmd_hostname() -> None:
+    name = os.uname().nodename.strip() or "device"
+    sys.stdout.write(re.sub(r"[^A-Za-z0-9_.-]+", "-", name)[:80] + "\n")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        fail(2, "usage: usage-bridge list|read|hostname <id>")
+    op = argv[1]
+    if op == "list":
+        cmd_list()
+        return 0
+    if op == "read":
+        if len(argv) < 3:
+            fail(2, "read needs an id")
+        cmd_read(argv[2])
+        return 0
+    if op == "hostname":
+        cmd_hostname()
+        return 0
+    fail(2, "unknown op")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

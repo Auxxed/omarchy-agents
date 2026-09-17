@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.auxxed.agents",
+  "name": "Agents",
+  "version": "1.1.0",
+  "author": "auxxed",
+  "license": "MIT",
+  "description": "Claude Code, Grok, Grok Bot, Hermes, Codex, and Fireworks usage in a native Omarchy bar panel, with launch for the selected agent.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agents",
+    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription.",
+    "category": "Developer Tools",
+    "aliases": [
+      "agents",
+      "model-usage"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "providers": {
+        "claude": {
+          "enabled": true
+        },
+        "grok": {
+          "enabled": true
+        },
+        "grok-bot": {
+          "enabled": true
+        },
+        "hermes": {
+          "enabled": true
+        },
+        "codex": {
+          "enabled": true
+        },
+        "fireworks": {
+          "enabled": true
+        }
+      },
+      "refreshIntervalSec": 900
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      }
+    ]
+  }
+}

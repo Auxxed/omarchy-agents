@@ -1,0 +1,48 @@
+#!/usr/bin/bash
+# Launch the named coding agent without changing Omarchy's default.
+# Permission-skip flags are intentionally omitted: a marketplace plugin
+# must not start a tool-capable agent in auto-approve mode.
+
+set -euo pipefail
+
+id="${1:-}"
+
+case "$id" in
+claude | codex | grok | grok-bot | opencode | gemini | copilot | crush | openclaw | cursor-agent | hermes | hermes-desktop | muse | omp | pi) ;;
+*)
+  exec /usr/bin/omarchy-agent --pick
+  ;;
+esac
+
+LAUNCH_OR_FOCUS=/usr/bin/omarchy-launch-or-focus
+LAUNCH_TUI=/usr/bin/omarchy-launch-tui
+
+if [[ $id == grok-bot ]]; then
+  exec "$LAUNCH_OR_FOCUS" "Grok Bot" "uwsm-app -- grok-bot"
+fi
+if [[ $id == hermes-desktop ]]; then
+  exec "$LAUNCH_OR_FOCUS" "Hermes" "uwsm-app -- hermes-desktop"
+fi
+
+[[ ${PWD:-} == "${HOME:-}" && -d $HOME/Work ]] && cd "$HOME/Work"
+
+case "$id" in
+opencode) command=(opencode) ;;
+gemini) command=(gemini) ;;
+copilot) command=(copilot) ;;
+crush) command=(crush) ;;
+claude) command=(claude) ;;
+grok) command=(grok) ;;
+openclaw) command=(omarchy-launch-openclaw --tui) ;;
+codex) command=(codex) ;;
+cursor-agent) command=(cursor-agent) ;;
+hermes) command=(hermes) ;;
+muse) command=(muse) ;;
+omp) command=(omp) ;;
+pi) command=(pi) ;;
+*)
+  exec /usr/bin/omarchy-agent --pick
+  ;;
+esac
+
+exec "$LAUNCH_TUI" --app-id=org.omarchy.agent "${command[@]}"
