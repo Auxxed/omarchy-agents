@@ -11,11 +11,13 @@ Hermes tab that works as a small control center:
   message count and model. Click one (or press `1`–`6`) to pick it back up:
   desktop sessions reopen in the Hermes app (`hermes://open/<id>`), CLI
   sessions resume in a terminal (`hermes --resume <id>`)
-- **New chat** / **Open app** buttons
+- **Open app** button (right-click the bar icon for a new Hermes chat)
 - **Pause / Resume**: Hermes' own emergency stop (`hermes pause`). It holds
   cron, kanban and new gateway turns; work already running keeps going
-- Gateway state, active agents, cron jobs (next run, failing count), and
-  estimated session cost today and this week
+- Gateway state, active agents, running delegated workers, cron jobs (next
+  run, failing count), and estimated session cost today and this week
+- Why and when the last session ended (Hermes' own `end_reason`, such as
+  `tui close` or `ws disconnect`)
 
 Forked from Omarchy's agents plugin (MIT). Cross-device snapshot sync from
 the stock widget is not included.
@@ -66,7 +68,7 @@ its own timer (default 15 minutes).
 - Hover the bar icon: the fullest limit (or balance) of every agent
 - In the panel: `h`/`l` switch subscription, `j`/`k` scroll, `r` or Enter
   refresh, Tab to the next bar panel, Esc closes
-- On the Hermes tab: `n` new chat, `o` open the app, `1`–`6` resume a session
+- On the Hermes tab: `o` open the app, `1`–`6` resume a session
 
 IPC (parameterless):
 

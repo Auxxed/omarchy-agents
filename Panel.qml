@@ -112,11 +112,6 @@ Panel {
     root.close()
   }
 
-  function newHermesChat() {
-    Util.execArgv([root.launchHelper, "hermes"])
-    root.close()
-  }
-
   function resumeHermesSession(session) {
     if (!session || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(session.id)) return
     Util.execArgv([root.launchHelper, "hermes-session", session.id, session.source === "desktop" ? "desktop" : "cli"])
@@ -144,7 +139,17 @@ Panel {
       parts.push(cron)
     }
     if (h.cronFailing > 0) parts.push(h.cronFailing + " failing")
+    if (h.runningWorkers > 0)
+      parts.push(h.runningWorkers + " worker" + (h.runningWorkers === 1 ? "" : "s") + " running")
     return parts.join(" · ")
+  }
+
+  // Hermes records lifecycle reasons (tui_close, ws_disconnect,
+  // compression…), not success or failure, so they are shown as-is.
+  function hermesLastEndedText(h) {
+    if (!h || h.lastEndReason === "") return ""
+    var when = relativeTime(h.lastEndedAt)
+    return "Last session ended" + (when !== "" ? " " + when : "") + ": " + h.lastEndReason.replace(/_/g, " ")
   }
 
   function hermesCostText(h) {
@@ -533,7 +538,6 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refreshNow()
-        else if (root.hermes && t === "n") root.newHermesChat()
         else if (root.hermes && t === "o") root.launchHermesApp()
         else if (root.hermes && /^[1-6]$/.test(t)) root.resumeHermesSession(root.hermes.sessions[Number(t) - 1])
       }
@@ -669,21 +673,8 @@ Panel {
               id: hermesActions
               width: parent.width
               spacing: Style.spacing.md
-              readonly property int count: root.hermes ? 3 : 1
+              readonly property int count: root.hermes ? 2 : 1
               readonly property real cellWidth: (width - spacing * (count - 1)) / count
-
-              Button {
-                visible: !!root.hermes
-                width: hermesActions.cellWidth
-                text: "New chat"
-                tooltipText: "Start Hermes in a terminal (n)"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                fontSize: Style.font.bodySmall
-                verticalPadding: Style.spacing.controlPaddingY
-                onClicked: root.newHermesChat()
-              }
 
               Button {
                 width: hermesActions.cellWidth
@@ -736,6 +727,17 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: text !== ""
+              width: parent.width
+              text: root.hermesLastEndedText(root.hermes)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
             }
           }
 

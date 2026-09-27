@@ -45,6 +45,7 @@ MAX_JOBS = 500
 MAX_RECENT_SESSIONS = 6
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+END_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 UNSAFE_TEXT_RE = re.compile("[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069<>&]")
 
 
@@ -314,6 +315,46 @@ def scan_recent_sessions(con: sqlite3.Connection, cols: set[str]) -> tuple[list[
     return recent, round(today_cost, 4), round(week_cost, 4)
 
 
+def running_workers(con: sqlite3.Connection) -> int:
+    """Delegated workers Hermes itself would treat as live: running or
+    finalizing, with the owning process still the same process."""
+    cols = {str(row[1]) for row in con.execute("pragma table_info(async_delegations)")}
+    if not {"state", "owner_pid"} <= cols:
+        return 0
+    started = "owner_started_at" if "owner_started_at" in cols else "null"
+    count = 0
+    for row in con.execute(
+        f"select owner_pid, {started} from async_delegations "
+        "where state in ('running', 'finalizing') limit 1000"
+    ):
+        pid, start = row[0], row[1]
+        if not isinstance(pid, int) or not 1 < pid < 4_194_304:
+            continue
+        ticks = process_start_ticks(pid)
+        if ticks is not None and (not isinstance(start, int) or start == ticks):
+            count += 1
+    return count
+
+
+def last_ended_session(con: sqlite3.Connection, cols: set[str]) -> dict[str, str]:
+    """Why and when the newest top-level session ended."""
+    if not {"ended_at", "end_reason"} <= cols:
+        return {"reason": "", "at": ""}
+    where = "ended_at is not null and coalesce(end_reason, '')!=''"
+    if "parent_session_id" in cols:
+        where += " and coalesce(parent_session_id, '')=''"
+    row = con.execute(
+        f"select end_reason, ended_at from sessions where {where} order by ended_at desc limit 1"
+    ).fetchone()
+    if row is None:
+        return {"reason": "", "at": ""}
+    reason = str(row["end_reason"] or "").lower()
+    return {
+        "reason": reason if END_REASON_RE.fullmatch(reason) else "",
+        "at": iso_from_epoch(row["ended_at"]),
+    }
+
+
 def scan_state_db(home: Path) -> dict[str, Any]:
     stats = empty_stats()
     today = date_string()
@@ -397,6 +438,10 @@ def scan_state_db(home: Path) -> dict[str, Any]:
                 stats["recentSessions"] = recent_sessions
                 stats["todayCostUsd"] = today_cost
                 stats["weekCostUsd"] = week_cost
+                stats["lastEnded"] = last_ended_session(con, cols)
+
+        if "async_delegations" in tables:
+            stats["runningWorkers"] = running_workers(con)
 
         stats["todaySessions"] = len(today_sessions)
         stats["totalSessions"] = len(sessions)
@@ -711,6 +756,8 @@ def main() -> int:
         "recentSessions": record.pop("recentSessions", []),
         "todayCostUsd": record.pop("todayCostUsd", 0.0),
         "weekCostUsd": record.pop("weekCostUsd", 0.0),
+        "runningWorkers": record.pop("runningWorkers", 0),
+        "lastEnded": record.pop("lastEnded", {"reason": "", "at": ""}),
     }
     print(json.dumps(record, separators=(",", ":"), sort_keys=True))
     return 0

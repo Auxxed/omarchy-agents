@@ -331,6 +331,8 @@ Item {
     }
     var gateway = raw.gateway && typeof raw.gateway === "object" ? raw.gateway : {}
     var cron = raw.cron && typeof raw.cron === "object" ? raw.cron : {}
+    var ended = raw.lastEnded && typeof raw.lastEnded === "object" ? raw.lastEnded : {}
+    var endReason = String(ended.reason || "")
     return {
       sessions: sessions,
       gatewayRunning: String(gateway.state || "") === "running",
@@ -341,7 +343,10 @@ Item {
       cronFailing: numberValue(cron.failing),
       cronNextRunAt: String(cron.nextRunAt || "").substring(0, 40),
       todayCostUsd: moneyValue(raw.todayCostUsd),
-      weekCostUsd: moneyValue(raw.weekCostUsd)
+      weekCostUsd: moneyValue(raw.weekCostUsd),
+      runningWorkers: numberValue(raw.runningWorkers),
+      lastEndReason: /^[a-z][a-z0-9_]{0,39}$/.test(endReason) ? endReason : "",
+      lastEndedAt: String(ended.at || "").substring(0, 40)
     }
   }
 
