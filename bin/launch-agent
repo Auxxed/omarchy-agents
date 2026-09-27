@@ -7,7 +7,6 @@ set -euo pipefail
 
 id="${1:-}"
 
-LAUNCH_OR_FOCUS=/usr/bin/omarchy-launch-or-focus
 LAUNCH_TUI=/usr/bin/omarchy-launch-tui
 
 # Hermes installs per user; prefer the fixed install locations over PATH.
@@ -28,7 +27,7 @@ hermes-session)
   source="${3:-cli}"
   [[ $sid =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ ]] || exit 2
   if [[ $source == desktop && -x /usr/bin/hermes-desktop ]]; then
-    exec /usr/bin/uwsm-app -- /usr/bin/hermes-desktop "hermes://open/$sid"
+    exec /usr/bin/uwsm-app -- /usr/bin/hermes-desktop "hermes://open/$sid" </dev/null >/dev/null 2>&1
   fi
   bin=$(hermes_bin) || exit 1
   [[ ${PWD:-} == "${HOME:-}" && -d $HOME/Work ]] && cd "$HOME/Work"
@@ -49,11 +48,28 @@ claude | codex | grok | grok-bot | opencode | gemini | copilot | crush | opencla
   ;;
 esac
 
+# Focus a desktop app by its exact window class, or start it. Not
+# omarchy-launch-or-focus: that also matches window titles, so a terminal
+# or browser tab with "Hermes" in its title would be focused instead.
+focus_or_launch() {
+  local class=$1
+  shift
+  local address
+  address=$(/usr/bin/hyprctl clients -j 2>/dev/null |
+    /usr/bin/jq -r --arg c "$class" 'first(.[] | select(.class == $c) | .address) // empty' 2>/dev/null)
+  if [[ $address =~ ^0x[0-9a-f]{1,16}$ ]]; then
+    /usr/bin/hyprctl dispatch "hl.dsp.focus({ window = \"address:$address\" })" >/dev/null 2>&1 ||
+      /usr/bin/hyprctl dispatch focuswindow "address:$address" >/dev/null
+    exit 0
+  fi
+  exec /usr/bin/setsid /usr/bin/uwsm-app -- "$@" </dev/null >/dev/null 2>&1
+}
+
 if [[ $id == grok-bot ]]; then
-  exec "$LAUNCH_OR_FOCUS" "Grok Bot" "uwsm-app -- grok-bot"
+  focus_or_launch "Grok Bot" grok-bot
 fi
 if [[ $id == hermes-desktop ]]; then
-  exec "$LAUNCH_OR_FOCUS" "Hermes" "uwsm-app -- hermes-desktop"
+  focus_or_launch "Hermes" /usr/bin/hermes-desktop
 fi
 
 [[ ${PWD:-} == "${HOME:-}" && -d $HOME/Work ]] && cd "$HOME/Work"
