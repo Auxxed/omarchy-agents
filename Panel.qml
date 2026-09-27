@@ -510,8 +510,10 @@ Panel {
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
     // Taller than the control panels on purpose: this one is a dashboard, and
-    // the whole point is reading limits and history without scrolling.
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(640))
+    // the whole point is reading limits and history without scrolling. The
+    // height is fixed rather than fitted so cycling tabs never resizes the
+    // card; a longer tab scrolls inside it.
+    contentHeight: panel.fittedContentHeight(Style.space(640), Style.space(640))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -549,9 +551,10 @@ Panel {
 
         Column {
           id: column
-          // Once the panel scrolls, the scrollbar sits over the right edge where
-          // the token counts are right-aligned; keep the content clear of it.
-          width: panelFlick.width - (panelFlick.interactive ? panelScrollBar.width + Style.space(6) : 0)
+          // The scrollbar sits over the right edge where the token counts are
+          // right-aligned. Its gutter is kept on every tab, scrolling or not,
+          // so cycling tabs never shifts the layout sideways.
+          width: panelFlick.width - panelScrollBar.width - Style.space(6)
           spacing: Style.space(12)
 
           // ---------- Hero: provider mark · name · plan ----------
