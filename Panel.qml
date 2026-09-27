@@ -545,11 +545,13 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        ScrollBar.vertical: ScrollBar { id: panelScrollBar; policy: ScrollBar.AsNeeded }
 
         Column {
           id: column
-          width: panelFlick.width
+          // Once the panel scrolls, the scrollbar sits over the right edge where
+          // the token counts are right-aligned; keep the content clear of it.
+          width: panelFlick.width - (panelFlick.interactive ? panelScrollBar.width + Style.space(6) : 0)
           spacing: Style.space(12)
 
           // ---------- Hero: provider mark · name · plan ----------
