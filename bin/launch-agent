@@ -7,15 +7,47 @@ set -euo pipefail
 
 id="${1:-}"
 
+LAUNCH_OR_FOCUS=/usr/bin/omarchy-launch-or-focus
+LAUNCH_TUI=/usr/bin/omarchy-launch-tui
+
+# Hermes installs per user; prefer the fixed install locations over PATH.
+hermes_bin() {
+  local candidate
+  for candidate in "$HOME/.local/bin/hermes" /usr/bin/hermes; do
+    [[ -x $candidate && ! -d $candidate ]] && { printf '%s' "$candidate"; return 0; }
+  done
+  return 1
+}
+
 case "$id" in
+hermes-session)
+  # hermes-session <session-id> <source>: desktop sessions reopen in the
+  # app through its hermes://open/<id> route, everything else resumes in a
+  # terminal. Ids come from the collector record, so re-check the shape here.
+  sid="${2:-}"
+  source="${3:-cli}"
+  [[ $sid =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ ]] || exit 2
+  if [[ $source == desktop && -x /usr/bin/hermes-desktop ]]; then
+    exec /usr/bin/uwsm-app -- /usr/bin/hermes-desktop "hermes://open/$sid"
+  fi
+  bin=$(hermes_bin) || exit 1
+  [[ ${PWD:-} == "${HOME:-}" && -d $HOME/Work ]] && cd "$HOME/Work"
+  exec "$LAUNCH_TUI" --app-id=org.omarchy.agent "$bin" --resume "$sid"
+  ;;
+hermes-pause | hermes-unpause)
+  # Hermes' own emergency stop: holds cron, kanban and new gateway turns;
+  # in-flight work keeps running.
+  bin=$(hermes_bin) || exit 1
+  if [[ $id == hermes-pause ]]; then
+    exec "$bin" pause --reason "Paused from the Omarchy bar"
+  fi
+  exec "$bin" resume
+  ;;
 claude | codex | grok | grok-bot | opencode | gemini | copilot | crush | openclaw | cursor-agent | hermes | hermes-desktop | muse | omp | pi) ;;
 *)
   exec /usr/bin/omarchy-agent --pick
   ;;
 esac
-
-LAUNCH_OR_FOCUS=/usr/bin/omarchy-launch-or-focus
-LAUNCH_TUI=/usr/bin/omarchy-launch-tui
 
 if [[ $id == grok-bot ]]; then
   exec "$LAUNCH_OR_FOCUS" "Grok Bot" "uwsm-app -- grok-bot"

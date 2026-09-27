@@ -25,13 +25,30 @@ Panel {
   // provider whose first scan lands while the panel is open would otherwise
   // shift the list underneath you and swap out what you were reading.
   property string selectedProviderId: ""
+  // Until you pick one, the panel (and right-click launch) follows the
+  // defaultProvider setting, falling back to the first tab.
+  readonly property string defaultProviderId: safeId(settings ? settings.defaultProvider : "")
   readonly property int providerIndex: {
-    for (var i = 0; i < providers.length; i++)
+    var fallback = 0
+    for (var i = 0; i < providers.length; i++) {
       if (providers[i].providerId === selectedProviderId) return i
-    return 0
+      if (providers[i].providerId === defaultProviderId) fallback = i
+    }
+    return fallback
   }
   readonly property var provider: providers.length > 0 ? providers[providerIndex] : null
   readonly property bool hermesSelected: !!provider && provider.providerId === "hermes"
+  readonly property var hermes: hermesSelected ? (provider.hermes || null) : null
+  property bool hermesControlPending: false
+
+  readonly property bool barShowPercent: !!settings
+    && (settings.barShowPercent === true || String(settings.barShowPercent) === "On")
+  // The selected agent's fullest window; an agent with no windows (a free
+  // or prepaid plan) hands the bar to the fullest window of any agent.
+  readonly property var barWindow: headline || busiestWindow()
+  readonly property string barPercentText: barWindow && barWindow.percent >= 0
+    ? Math.round(clamp(barWindow.percent, 0, 1) * 100) + "%"
+    : ""
 
   property bool cursorActive: false
 
@@ -93,6 +110,76 @@ Panel {
   function launchHermesApp() {
     Util.execArgv([root.launchHelper, "hermes-desktop"])
     root.close()
+  }
+
+  function newHermesChat() {
+    Util.execArgv([root.launchHelper, "hermes"])
+    root.close()
+  }
+
+  function resumeHermesSession(session) {
+    if (!session || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(session.id)) return
+    Util.execArgv([root.launchHelper, "hermes-session", session.id, session.source === "desktop" ? "desktop" : "cli"])
+    root.close()
+  }
+
+  // Hermes' emergency stop holds cron, kanban and new gateway turns; it
+  // never kills work already running. Only a click here toggles it.
+  function toggleHermesPause() {
+    if (!root.hermes || hermesControl.running) return
+    root.hermesControlPending = true
+    hermesControl.command = [root.launchHelper, root.hermes.paused ? "hermes-unpause" : "hermes-pause"]
+    hermesControl.running = true
+  }
+
+  function hermesStatusText(h) {
+    if (!h) return ""
+    var parts = [h.gatewayRunning ? "Gateway running" : "Gateway stopped"]
+    if (h.gatewayRunning && h.activeAgents > 0)
+      parts.push(h.activeAgents + " agent" + (h.activeAgents === 1 ? "" : "s") + " working")
+    if (h.cronJobs > 0) {
+      var cron = h.cronActive + " cron job" + (h.cronActive === 1 ? "" : "s")
+      var next = h.cronNextRunAt !== "" ? new Date(h.cronNextRunAt).getTime() - root.nowMs : -1
+      if (!h.paused && next > 0) cron += ", next in " + formatDuration(next)
+      parts.push(cron)
+    }
+    if (h.cronFailing > 0) parts.push(h.cronFailing + " failing")
+    return parts.join(" · ")
+  }
+
+  function hermesCostText(h) {
+    if (!h || (h.todayCostUsd <= 0 && h.weekCostUsd <= 0)) return ""
+    return formatMoney(h.todayCostUsd, "USD") + " today · " + formatMoney(h.weekCostUsd, "USD") + " this week"
+  }
+
+  function relativeTime(iso) {
+    var ms = new Date(String(iso || "")).getTime()
+    if (!isFinite(ms)) return ""
+    var ago = root.nowMs - ms
+    if (ago < 60000) return "now"
+    return formatDuration(ago).split(" ")[0] + " ago"
+  }
+
+  function sessionMeta(session) {
+    if (!session) return ""
+    var parts = []
+    var when = relativeTime(session.lastActivityAt)
+    if (when !== "") parts.push(when)
+    parts.push(session.messages + " msg")
+    if (session.model !== "") parts.push(usage.friendlyModelName(session.model))
+    return parts.join(" · ")
+  }
+
+  // Hover summary for the bar icon: the fullest window of every agent.
+  function barTooltip() {
+    var parts = []
+    for (var i = 0; i < providers.length && parts.length < 6; i++) {
+      var w = bindingWindow(providers[i])
+      var name = plain(providers[i].providerName, 20)
+      if (w) parts.push(name + " " + Math.round(clamp(w.percent, 0, 1) * 100) + "%")
+      else if (providers[i].balance) parts.push(name + " " + formatMoney(providers[i].balance.remaining, providers[i].balance.currency))
+    }
+    return plain(parts.join(" · "), 160)
   }
 
   // ---------------------------------------------------------------- limits
@@ -159,6 +246,15 @@ Panel {
     var best = null
     for (var i = 0; i < windows.length; i++) {
       if (!best || windows[i].percent > best.percent) best = windows[i]
+    }
+    return best
+  }
+
+  function busiestWindow() {
+    var best = null
+    for (var i = 0; i < providers.length; i++) {
+      var w = bindingWindow(providers[i])
+      if (w && (!best || w.percent > best.percent)) best = w
     }
     return best
   }
@@ -331,8 +427,9 @@ Panel {
   // is invisible, so the icon appears the moment the first scan finds usage and
   // stays away entirely on a machine that has never run either CLI.
   visible: providers.length > 0
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
+  readonly property Item barButton: barShowPercent && barPercentText !== "" ? percentButton : button
+  implicitWidth: barButton.implicitWidth
+  implicitHeight: barButton.implicitHeight
 
   onProviderIndexChanged: if (panelFlick) panelFlick.contentY = 0
   onOpenedChanged: if (opened) {
@@ -357,6 +454,15 @@ Panel {
     onTriggered: root.nowMs = Date.now()
   }
 
+  Process {
+    id: hermesControl
+    running: false
+    onExited: {
+      root.hermesControlPending = false
+      usage.runUpdate("normal", ["hermes"])
+    }
+  }
+
   IpcHandler {
     target: root.ipcTarget
     function open(): void { root.open() }
@@ -366,22 +472,38 @@ Panel {
     function toggle(): void { root.toggle() }
   }
 
+  function barPressed(buttonCode) {
+    if (buttonCode === Qt.RightButton) root.launchAgent()
+    else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
+    else root.toggle()
+  }
+
   BarIconButton {
     id: button
     anchors.fill: parent
+    visible: root.barButton === button
     bar: root.bar
     text: "󱚣"
     active: root.alarming
-    onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) root.launchAgent()
-      else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
-      else root.toggle()
-    }
+    tooltipText: root.barTooltip()
+    onPressed: function(buttonCode) { root.barPressed(buttonCode) }
+  }
+
+  // Opt-in (barShowPercent): the icon plus the selected agent's fullest window.
+  WidgetButton {
+    id: percentButton
+    anchors.fill: parent
+    visible: root.barButton === percentButton
+    bar: root.bar
+    text: "󱚣 " + root.barPercentText
+    active: root.alarming
+    tooltipText: root.barTooltip()
+    onPressed: function(buttonCode) { root.barPressed(buttonCode) }
   }
 
   KeyboardPanel {
     id: panel
-    anchorItem: button
+    anchorItem: root.barButton
     owner: root
     bar: root.bar
     open: root.opened
@@ -407,7 +529,12 @@ Panel {
       onActivateRequested: root.refreshNow()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r" || t === "R") root.refreshNow() }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") root.refreshNow()
+        else if (root.hermes && t === "n") root.newHermesChat()
+        else if (root.hermes && t === "o") root.launchHermesApp()
+        else if (root.hermes && /^[1-6]$/.test(t)) root.resumeHermesSession(root.hermes.sessions[Number(t) - 1])
+      }
 
       Flickable {
         id: panelFlick
@@ -526,17 +653,85 @@ Panel {
             }
           }
 
-          Button {
+          // ---------- Hermes controls ----------
+          Column {
+            id: hermesSection
             visible: root.hermesSelected
             width: parent.width
-            text: "Open app"
-            tooltipText: "Open Hermes desktop"
-            bordered: true
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            fontSize: Style.font.bodySmall
-            verticalPadding: Style.spacing.controlPaddingY
-            onClicked: root.launchHermesApp()
+            spacing: Style.space(8)
+
+            Row {
+              id: hermesActions
+              width: parent.width
+              spacing: Style.spacing.md
+              readonly property int count: root.hermes ? 3 : 1
+              readonly property real cellWidth: (width - spacing * (count - 1)) / count
+
+              Button {
+                visible: !!root.hermes
+                width: hermesActions.cellWidth
+                text: "New chat"
+                tooltipText: "Start Hermes in a terminal (n)"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                verticalPadding: Style.spacing.controlPaddingY
+                onClicked: root.newHermesChat()
+              }
+
+              Button {
+                width: hermesActions.cellWidth
+                text: "Open app"
+                tooltipText: "Open Hermes desktop (o)"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                verticalPadding: Style.spacing.controlPaddingY
+                onClicked: root.launchHermesApp()
+              }
+
+              Button {
+                visible: !!root.hermes
+                width: hermesActions.cellWidth
+                text: root.hermesControlPending ? "…" : (root.hermes && root.hermes.paused ? "Resume" : "Pause")
+                tooltipText: root.hermes && root.hermes.paused
+                  ? "Lift the emergency stop"
+                  : "Hold cron, kanban and new gateway turns"
+                selected: !!root.hermes && root.hermes.paused
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                verticalPadding: Style.spacing.controlPaddingY
+                onClicked: root.toggleHermesPause()
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: !!root.hermes
+              width: parent.width
+              text: root.hermes && root.hermes.paused
+                ? "Paused: scheduled and incoming work is on hold"
+                : root.hermesStatusText(root.hermes)
+              color: root.hermes && (root.hermes.paused || root.hermes.cronFailing > 0)
+                ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: text !== ""
+              width: parent.width
+              text: root.hermesCostText(root.hermes)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
 
           // ---------- Status ----------
@@ -561,6 +756,38 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+          }
+
+          // ---------- Hermes sessions ----------
+          PanelSeparator {
+            visible: sessionSection.visible
+            foreground: root.foreground
+          }
+
+          Column {
+            id: sessionSection
+            visible: !!root.hermes && root.hermes.sessions.length > 0
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "RECENT SESSIONS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: root.hermes ? root.hermes.sessions : []
+
+              SessionRow {
+                required property var modelData
+                required property int index
+                width: sessionSection.width
+                session: modelData
+                shortcut: index + 1
+              }
             }
           }
 
@@ -743,6 +970,86 @@ Panel {
           }
         }
       }
+    }
+  }
+
+  // One Hermes session: click (or its number key) to pick it back up where
+  // it lives, the desktop app or a terminal.
+  component SessionRow: Item {
+    id: sessionRow
+    property var session: null
+    property int shortcut: 0
+
+    implicitHeight: sessionTitle.implicitHeight + sessionMeta.implicitHeight + Style.spacing.lg
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: root.alpha(root.foreground, sessionHover.containsMouse ? 0.12 : 0.04)
+    }
+
+    Text {
+      id: sessionKey
+      textFormat: Text.PlainText
+      text: String(sessionRow.shortcut)
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(12)
+    }
+
+    Text {
+      id: sessionTitle
+      textFormat: Text.PlainText
+      text: sessionRow.session
+        ? (sessionRow.session.pinned ? "★ " : "") + sessionRow.session.title
+        : ""
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+      anchors.left: sessionKey.right
+      anchors.leftMargin: Style.space(6)
+      anchors.right: sessionSource.left
+      anchors.rightMargin: Style.space(8)
+      anchors.top: parent.top
+      anchors.topMargin: Style.spacing.lg / 2
+    }
+
+    Text {
+      id: sessionMeta
+      textFormat: Text.PlainText
+      text: root.sessionMeta(sessionRow.session)
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+      anchors.left: sessionTitle.left
+      anchors.right: sessionTitle.right
+      anchors.top: sessionTitle.bottom
+    }
+
+    Text {
+      id: sessionSource
+      textFormat: Text.PlainText
+      text: sessionRow.session ? (sessionRow.session.source === "desktop" ? "app" : sessionRow.session.source) : ""
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+    }
+
+    MouseArea {
+      id: sessionHover
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.resumeHermesSession(sessionRow.session)
     }
   }
 

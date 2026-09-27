@@ -140,6 +140,62 @@ def clip_num(value: Any) -> int:
     return min(10**12, round(n))
 
 
+HERMES_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+HERMES_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+MAX_HERMES_SESSIONS = 6
+
+
+def clip_money(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    n = float(value)
+    return n if n == n and 0 <= n < 1e9 else 0.0
+
+
+def sanitize_hermes(raw: Any) -> dict[str, Any] | None:
+    """Hermes control data: every id here later reaches an argv."""
+    if not isinstance(raw, dict):
+        return None
+    sessions = []
+    items = raw.get("recentSessions") if isinstance(raw.get("recentSessions"), list) else []
+    for entry in items[:MAX_HERMES_SESSIONS]:
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("id")
+        if not isinstance(sid, str) or not HERMES_SESSION_RE.fullmatch(sid):
+            continue
+        source = entry.get("source")
+        sessions.append({
+            "id": sid,
+            "title": clip_str(entry.get("title"), 80),
+            "source": source if isinstance(source, str) and HERMES_SOURCE_RE.fullmatch(source) else "cli",
+            "model": clip_str(entry.get("model"), 64),
+            "messages": clip_num(entry.get("messages")),
+            "lastActivityAt": clip_str(entry.get("lastActivityAt"), 40),
+            "open": entry.get("open") is True,
+            "pinned": entry.get("pinned") is True,
+            "costUsd": clip_money(entry.get("costUsd")),
+        })
+    gateway = raw.get("gateway") if isinstance(raw.get("gateway"), dict) else {}
+    cron = raw.get("cron") if isinstance(raw.get("cron"), dict) else {}
+    return {
+        "recentSessions": sessions,
+        "gateway": {
+            "state": clip_str(gateway.get("state"), 24),
+            "activeAgents": clip_num(gateway.get("activeAgents")),
+        },
+        "paused": raw.get("paused") is True,
+        "cron": {
+            "jobs": clip_num(cron.get("jobs")),
+            "active": clip_num(cron.get("active")),
+            "failing": clip_num(cron.get("failing")),
+            "nextRunAt": clip_str(cron.get("nextRunAt"), 40),
+        },
+        "todayCostUsd": clip_money(raw.get("todayCostUsd")),
+        "weekCostUsd": clip_money(raw.get("weekCostUsd")),
+    }
+
+
 def sanitize_record(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -228,6 +284,9 @@ def sanitize_record(raw: Any) -> dict[str, Any] | None:
     }
     if balance is not None:
         out["balance"] = balance
+    hermes = sanitize_hermes(raw.get("hermes")) if rid == "hermes" else None
+    if hermes is not None:
+        out["hermes"] = hermes
     return out
 
 

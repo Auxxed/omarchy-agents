@@ -17,6 +17,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -38,6 +39,13 @@ MAX_HTTP_BYTES = 1_048_576
 HTTP_TIMEOUT = 12
 PROBE_MIN_INTERVAL_SECONDS = 15
 MAX_DB_BYTES = 256 * 1024 * 1024
+MAX_STATE_BYTES = 65536
+MAX_JOBS_BYTES = 1_048_576
+MAX_JOBS = 500
+MAX_RECENT_SESSIONS = 6
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+UNSAFE_TEXT_RE = re.compile("[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069<>&]")
 
 
 def expand_path(value: str) -> Path:
@@ -225,6 +233,87 @@ def model_name(value: Any) -> str:
     return raw if raw else "hermes"
 
 
+def clean_text(value: Any, limit: int) -> str:
+    text = UNSAFE_TEXT_RE.sub("", str(value or "")).strip()
+    return text[:limit]
+
+
+def epoch_seconds(value: Any) -> float:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if n != n or n <= 0:
+        return 0.0
+    return n / 1000.0 if n > 10_000_000_000 else n
+
+
+def iso_from_epoch(value: Any) -> str:
+    seconds = epoch_seconds(value)
+    if not seconds:
+        return ""
+    try:
+        return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def session_cost(row: sqlite3.Row, cols: set[str]) -> float:
+    for col in ("actual_cost_usd", "estimated_cost_usd"):
+        if col in cols:
+            amount = money(row[col])
+            if amount is not None and amount >= 0:
+                return amount
+    return 0.0
+
+
+def scan_recent_sessions(con: sqlite3.Connection, cols: set[str]) -> tuple[list[dict[str, Any]], float, float]:
+    """Newest top-level sessions for the panel, plus cost by last activity."""
+    wanted = ["id", "title", "source", "model", "message_count", "started_at",
+              "last_activity_at", "ended_at", "pinned", "parent_session_id",
+              "actual_cost_usd", "estimated_cost_usd"]
+    select = ", ".join(c for c in wanted if c in cols)
+    where = "coalesce(archived, 0)=0 and coalesce(hidden, 0)=0"
+    if "parent_session_id" in cols:
+        where += " and coalesce(parent_session_id, '')=''"
+    today = date_string()
+    week = set(recent_date_strings())
+    week_start = min(week)
+    today_cost = 0.0
+    week_cost = 0.0
+    recent: list[dict[str, Any]] = []
+    order = "coalesce(last_activity_at, started_at)" if "last_activity_at" in cols else "started_at"
+    for row in con.execute(f"select {select} from sessions where {where} order by {order} desc"):
+        activity = row["last_activity_at"] if "last_activity_at" in cols else None
+        day = local_date_from_timestamp(activity or row["started_at"])
+        cost = session_cost(row, cols)
+        if day == today:
+            today_cost += cost
+        if day in week:
+            week_cost += cost
+        if len(recent) >= MAX_RECENT_SESSIONS:
+            # Rows arrive newest first: past the week there is no cost left to count.
+            if day < week_start:
+                break
+            continue
+        sid = str(row["id"] or "")
+        if not SESSION_ID_RE.fullmatch(sid):
+            continue
+        source = str(row["source"] or "").lower() if "source" in cols else ""
+        recent.append({
+            "id": sid,
+            "title": clean_text(row["title"] if "title" in cols else "", 80) or "Untitled session",
+            "source": source if SOURCE_RE.fullmatch(source) else "cli",
+            "model": clean_text(row["model"] if "model" in cols else "", 64),
+            "messages": number(row["message_count"]) if "message_count" in cols else 0,
+            "lastActivityAt": iso_from_epoch(activity or row["started_at"]),
+            "open": "ended_at" in cols and row["ended_at"] is None,
+            "pinned": "pinned" in cols and bool(row["pinned"]),
+            "costUsd": round(cost, 4),
+        })
+    return recent, round(today_cost, 4), round(week_cost, 4)
+
+
 def scan_state_db(home: Path) -> dict[str, Any]:
     stats = empty_stats()
     today = date_string()
@@ -301,6 +390,14 @@ def scan_state_db(home: Path) -> dict[str, Any]:
                     stats["todayTokensByModel"][model] = stats["todayTokensByModel"].get(model, 0) + total
             stats["todayTotalTokens"] = today_total
 
+        if "sessions" in tables:
+            cols = {str(row[1]) for row in con.execute("pragma table_info(sessions)")}
+            if "id" in cols and "started_at" in cols:
+                recent_sessions, today_cost, week_cost = scan_recent_sessions(con, cols)
+                stats["recentSessions"] = recent_sessions
+                stats["todayCostUsd"] = today_cost
+                stats["weekCostUsd"] = week_cost
+
         stats["todaySessions"] = len(today_sessions)
         stats["totalSessions"] = len(sessions)
         stats["activeDays"] = len(active_days)
@@ -309,6 +406,77 @@ def scan_state_db(home: Path) -> dict[str, Any]:
         return stats
     finally:
         close_state_db(opened)
+
+
+def process_start_ticks(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read(4096)
+        fields = raw.rsplit(b")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def gateway_status(home: Path) -> dict[str, Any]:
+    """Running only when the recorded pid is alive and is the same process
+    (start time matches), so a reused pid never reads as a live gateway."""
+    state = read_bounded_json(home / "gateway_state.json", MAX_STATE_BYTES) or {}
+    pid = state.get("pid")
+    recorded = str(state.get("gateway_state") or "")
+    alive = False
+    if isinstance(pid, int) and not isinstance(pid, bool) and 1 < pid < 4_194_304:
+        ticks = process_start_ticks(pid)
+        start = state.get("start_time")
+        alive = ticks is not None and (not isinstance(start, int) or start == ticks)
+    active = state.get("active_agents")
+    return {
+        "state": "running" if alive and recorded in ("running", "") else ("stopped" if not alive else clean_text(recorded, 24)),
+        "activeAgents": active if isinstance(active, int) and 0 <= active < 10_000 else 0,
+    }
+
+
+def estop_engaged(home: Path) -> bool:
+    try:
+        os.lstat(home / "ESTOP")
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def cron_status(home: Path) -> dict[str, Any]:
+    data = read_bounded_json(home / "cron" / "jobs.json", MAX_JOBS_BYTES)
+    jobs = data.get("jobs") if isinstance(data, dict) else None
+    result: dict[str, Any] = {"jobs": 0, "active": 0, "failing": 0, "nextRunAt": ""}
+    if not isinstance(jobs, list):
+        return result
+    next_run: dt.datetime | None = None
+    for job in jobs[:MAX_JOBS]:
+        if not isinstance(job, dict):
+            continue
+        result["jobs"] += 1
+        paused = str(job.get("state") or "") == "paused" or bool(job.get("paused_at"))
+        if job.get("enabled", True) is False or paused:
+            continue
+        result["active"] += 1
+        if job.get("last_status") == "error":
+            result["failing"] += 1
+        raw = job.get("next_run_at")
+        if not isinstance(raw, str) or len(raw) > 64:
+            continue
+        try:
+            when = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.astimezone()
+        if next_run is None or when < next_run:
+            next_run = when
+    if next_run is not None:
+        result["nextRunAt"] = next_run.astimezone(dt.timezone.utc).isoformat()
+    return result
 
 
 class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -536,6 +704,14 @@ def main() -> int:
     if limits.get("balance") is not None:
         record["balance"] = limits["balance"]
     record.update(stats)
+    record["hermes"] = {
+        "gateway": gateway_status(home),
+        "paused": estop_engaged(home),
+        "cron": cron_status(home),
+        "recentSessions": record.pop("recentSessions", []),
+        "todayCostUsd": record.pop("todayCostUsd", 0.0),
+        "weekCostUsd": record.pop("weekCostUsd", 0.0),
+    }
     print(json.dumps(record, separators=(",", ":"), sort_keys=True))
     return 0
 

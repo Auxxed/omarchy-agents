@@ -296,10 +296,58 @@ Item {
       hasLocalStats: synced ? (stats.hasLocalStats !== false) : (record.hasLocalStats !== false),
       hasPromptStats: synced ? (stats.hasPromptStats !== false) : (record.hasPromptStats !== false),
 
+      // Hermes-only control data: recent sessions, gateway, cron, pause.
+      hermes: hermesInfo(record.hermes),
+
       syncEnabled: synced,
       syncDeviceCount: deviceCount,
       syncUpdatedAt: aggregateData && aggregateData.updatedAt ? aggregateData.updatedAt : ""
     }
+  }
+
+  // The record is a file on disk, so every field the panel acts on is
+  // re-checked here: session ids reach an argv, titles reach text sinks.
+  function hermesInfo(raw) {
+    if (!raw || typeof raw !== "object") return null
+    var sessions = []
+    var list = Array.isArray(raw.recentSessions) ? raw.recentSessions.slice(0, 6) : []
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i]
+      if (!s || typeof s !== "object") continue
+      var id = String(s.id || "")
+      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(id)) continue
+      var source = String(s.source || "")
+      sessions.push({
+        id: id,
+        title: String(s.title || "Untitled session").substring(0, 80),
+        source: /^[a-z][a-z0-9_-]{0,31}$/.test(source) ? source : "cli",
+        model: String(s.model || "").substring(0, 64),
+        messages: numberValue(s.messages),
+        lastActivityAt: String(s.lastActivityAt || "").substring(0, 40),
+        open: s.open === true,
+        pinned: s.pinned === true,
+        costUsd: moneyValue(s.costUsd)
+      })
+    }
+    var gateway = raw.gateway && typeof raw.gateway === "object" ? raw.gateway : {}
+    var cron = raw.cron && typeof raw.cron === "object" ? raw.cron : {}
+    return {
+      sessions: sessions,
+      gatewayRunning: String(gateway.state || "") === "running",
+      activeAgents: numberValue(gateway.activeAgents),
+      paused: raw.paused === true,
+      cronJobs: numberValue(cron.jobs),
+      cronActive: numberValue(cron.active),
+      cronFailing: numberValue(cron.failing),
+      cronNextRunAt: String(cron.nextRunAt || "").substring(0, 40),
+      todayCostUsd: moneyValue(raw.todayCostUsd),
+      weekCostUsd: moneyValue(raw.weekCostUsd)
+    }
+  }
+
+  function moneyValue(value) {
+    var n = Number(value)
+    return isFinite(n) && n >= 0 ? n : 0
   }
 
   function setting(name, fallback) {

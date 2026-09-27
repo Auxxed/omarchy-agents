@@ -4,8 +4,18 @@ A bar widget for Omarchy Quattro that shows usage and limits for the coding
 agents on this machine, and can launch the one you have selected.
 
 This is a fork of the built-in `omarchy.agents` panel. It adds Grok, Grok Bot,
-and Hermes collectors, a right-click launch for the selected agent, and an
-**Open app** button on the Hermes tab for the Hermes desktop app.
+and Hermes collectors, a right-click launch for the selected agent, and a
+Hermes tab that works as a small control center:
+
+- **Recent sessions**: the last six top-level sessions with title, age,
+  message count and model. Click one (or press `1`–`6`) to pick it back up:
+  desktop sessions reopen in the Hermes app (`hermes://open/<id>`), CLI
+  sessions resume in a terminal (`hermes --resume <id>`)
+- **New chat** / **Open app** buttons
+- **Pause / Resume**: Hermes' own emergency stop (`hermes pause`). It holds
+  cron, kanban and new gateway turns; work already running keeps going
+- Gateway state, active agents, cron jobs (next run, failing count), and
+  estimated session cost today and this week
 
 Forked from Omarchy's agents plugin (MIT). Cross-device snapshot sync from
 the stock widget is not included.
@@ -53,9 +63,10 @@ its own timer (default 15 minutes).
 - **Middle-click**: next subscription
 - **Right-click**: launch the selected agent in a terminal (Grok Bot focuses
   the desktop app). Agents start without auto-approve / `--yolo` flags
-- Hermes panel **Open app**: focus or launch `hermes-desktop`
+- Hover the bar icon: the fullest limit (or balance) of every agent
 - In the panel: `h`/`l` switch subscription, `j`/`k` scroll, `r` or Enter
   refresh, Tab to the next bar panel, Esc closes
+- On the Hermes tab: `n` new chat, `o` open the app, `1`–`6` resume a session
 
 IPC (parameterless):
 
@@ -67,6 +78,20 @@ omarchy-shell io.github.auxxed.agents toggle
 
 ```sh
 omarchy bar set io.github.auxxed.agents refreshIntervalSec 300 --json
+```
+
+Open on a given tab (and make right-click launch that agent) until you pick
+another one:
+
+```sh
+omarchy bar set io.github.auxxed.agents defaultProvider hermes
+```
+
+Show the fullest limit next to the bar icon. It uses the selected agent, or
+the fullest window of any agent when the selected one has none:
+
+```sh
+omarchy bar set io.github.auxxed.agents barShowPercent On
 ```
 
 Disable a tab by writing the whole `providers` object:
@@ -99,13 +124,33 @@ Local stats do not go to the network: Grok sessions under `~/.grok`, Hermes
 `~/.hermes/state.db`, Claude/Codex transcripts as the packaged collectors
 already do.
 
+The Hermes collector also reads, without writing, `~/.hermes/gateway_state.json`
+(the gateway counts as running only if its recorded pid is alive with the
+same start time), `~/.hermes/cron/jobs.json`, and whether `~/.hermes/ESTOP`
+exists. Session titles are stored in `hermes.json` (see below).
+
+## Commands this plugin runs
+
+Only on a click or key press in the panel, as argv arrays through
+`bin/launch-agent`:
+
+| Action | Command |
+|---|---|
+| Resume desktop session | `uwsm-app -- hermes-desktop hermes://open/<id>` |
+| Resume CLI session | `hermes --resume <id>` in `omarchy-launch-tui` |
+| Pause / Resume | `hermes pause --reason "Paused from the Omarchy bar"` / `hermes resume` |
+
+Session ids are checked against `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$` in the
+collector, the usage bridge, the panel and the launcher. `hermes` is taken
+from `~/.local/bin/hermes` or `/usr/bin/hermes`, not from `PATH`.
+
 ## Files this plugin writes
 
 Created on refresh, mode 0600, inside `~/.local/state/omarchy/agents/usage/`:
 
 - `grok.json`
 - `grok-bot.json` (removed when Grok Bot is not signed in)
-- `hermes.json`
+- `hermes.json` (includes the titles of your six most recent Hermes sessions)
 
 Claude, Codex, and Fireworks records in that same directory are written by
 Omarchy's packaged `omarchy-agent-usage-update`, not by this plugin.

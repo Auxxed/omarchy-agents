@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.auxxed.agents",
   "name": "Agents",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "auxxed",
   "license": "MIT",
-  "description": "Claude Code, Grok, Grok Bot, Hermes, Codex, and Fireworks usage in a native Omarchy bar panel, with launch for the selected agent.",
+  "description": "Claude Code, Grok, Grok Bot, Hermes, Codex, and Fireworks usage in a native Omarchy bar panel, with launch for the selected agent and Hermes session, gateway and cron controls.",
   "kinds": [
     "bar-widget"
   ],
@@ -43,7 +43,9 @@
           "enabled": true
         }
       },
-      "refreshIntervalSec": 900
+      "refreshIntervalSec": 900,
+      "defaultProvider": "",
+      "barShowPercent": "Off"
     },
     "schema": [
       {
@@ -54,6 +56,24 @@
         "max": 3600,
         "step": 30,
         "defaultValue": 900
+      },
+      {
+        "key": "defaultProvider",
+        "type": "string",
+        "label": "Default tab (agent id, e.g. hermes)",
+        "defaultValue": "",
+        "description": "Agent id the panel and right-click open on, such as hermes or claude. Empty uses the first tab."
+      },
+      {
+        "key": "barShowPercent",
+        "type": "enum",
+        "label": "Usage percent in the bar",
+        "options": [
+          "Off",
+          "On"
+        ],
+        "defaultValue": "Off",
+        "description": "Show the selected agent's fullest limit next to the icon."
       }
     ]
   }
