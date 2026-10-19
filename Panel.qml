@@ -270,6 +270,14 @@ Panel {
     return isFinite(ms) ? ms - root.nowMs : -1
   }
 
+  // "LIMITS · AS OF 2D 4H AGO" while the limits are a cached copy.
+  function limitsAge(p) {
+    if (!p || String(p.limitsAsOf || "") === "") return ""
+    var at = Date.parse(p.limitsAsOf)
+    if (!isFinite(at)) return ""
+    return formatDuration(root.nowMs - at) + " ago"
+  }
+
   function formatDuration(ms) {
     if (!(ms > 0)) return "now"
     var minutes = Math.floor(ms / 60000)
@@ -309,10 +317,10 @@ Panel {
   // ---------------------------------------------------------------- content
 
   // The plan you pay for, under the name of the tool it pays for. Limits live
-  // in their own section; the hero just says what this is.
+  // in their own section and a sign-in problem in the status box; the hero
+  // just says what this is, so the two never say the same thing twice.
   function heroMeta(p) {
     if (!p) return ""
-    if (String(p.usageStatusText || "") !== "") return p.usageStatusText
     var tier = String(p.tierLabel || "")
     if (tier === "") return "Subscription"
     return tier.charAt(0).toUpperCase() + tier.slice(1)
@@ -676,11 +684,14 @@ Panel {
               readonly property int count: root.hermes ? 2 : 1
               readonly property real cellWidth: (width - spacing * (count - 1)) / count
 
+              // Actions, not tabs: an icon and no border, so they don't read
+              // as more of the agent switch above.
               Button {
                 width: hermesActions.cellWidth
+                iconText: "\u{F03CC}"
                 text: "Open app"
                 tooltipText: "Open Hermes desktop (o)"
-                bordered: true
+                bordered: false
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
@@ -691,12 +702,13 @@ Panel {
               Button {
                 visible: !!root.hermes
                 width: hermesActions.cellWidth
+                iconText: root.hermes && root.hermes.paused ? "\u{F040A}" : "\u{F03E4}"
                 text: root.hermesControlPending ? "…" : (root.hermes && root.hermes.paused ? "Resume" : "Pause")
                 tooltipText: root.hermes && root.hermes.paused
                   ? "Lift the emergency stop"
                   : "Hold cron, kanban and new gateway turns"
                 selected: !!root.hermes && root.hermes.paused
-                bordered: true
+                bordered: false
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
@@ -742,12 +754,17 @@ Panel {
           }
 
           // ---------- Status ----------
+          // What's wrong and the fix in one box. Urgent only when the agent
+          // has nothing usable to show; a working agent with one source
+          // missing (no Portal sign-in, cached limits) gets a quiet note.
           BorderSurface {
+            id: statusBox
+            readonly property bool blocking: !!root.provider && root.provider.ready !== true
             visible: !!root.provider && String(root.provider.usageStatusText || "") !== ""
             width: parent.width
             implicitHeight: statusText.implicitHeight + Style.spacing.xl * 2
-            color: root.alpha(root.urgent, 0.10)
-            borderSpec: Border.flat(root.alpha(root.urgent, 0.35), 1)
+            color: blocking ? root.alpha(root.urgent, 0.10) : root.alpha(root.foreground, 0.05)
+            borderSpec: Border.flat(blocking ? root.alpha(root.urgent, 0.35) : root.alpha(root.foreground, 0.18), 1)
             radius: Style.cornerRadius
 
             Text {
@@ -758,8 +775,13 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               anchors.leftMargin: Style.space(12)
               anchors.rightMargin: Style.space(12)
-              text: root.provider ? root.plain(root.provider.authHelpText, 200) : ""
-              color: root.dim
+              text: {
+                if (!root.provider) return ""
+                var status = root.plain(root.provider.usageStatusText, 80)
+                var help = root.plain(root.provider.authHelpText, 200)
+                return help !== "" ? status + ". " + help : status
+              }
+              color: statusBox.blocking ? root.foreground : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
@@ -875,7 +897,9 @@ Panel {
             spacing: Style.space(10)
 
             PanelSectionHeader {
-              text: "LIMITS"
+              text: root.limitsAge(root.provider) !== ""
+                ? "LIMITS · AS OF " + root.limitsAge(root.provider).toUpperCase()
+                : "LIMITS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -887,6 +911,7 @@ Panel {
                 required property var modelData
                 width: limitsSection.width
                 window: modelData
+                opacity: root.limitsAge(root.provider) !== "" ? 0.55 : 1
               }
             }
           }
@@ -906,6 +931,8 @@ Panel {
             readonly property var days: root.provider ? (root.provider.recentDays || []) : []
             readonly property real peak: Math.max(1, root.weekPeak(root.provider))
 
+            readonly property bool quiet: root.weekPeak(root.provider) <= 0
+
             PanelSectionHeader {
               width: parent.width
               text: "TOKENS BY DAY"
@@ -913,8 +940,18 @@ Panel {
               fontFamily: root.fontFamily
             }
 
+            Text {
+              textFormat: Text.PlainText
+              visible: usageSection.quiet
+              width: parent.width
+              text: "Nothing in the last 7 days"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
             Repeater {
-              model: usageSection.days
+              model: usageSection.quiet ? [] : usageSection.days
 
               DayRow {
                 required property var modelData

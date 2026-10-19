@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -20,6 +21,25 @@ ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 COLLECTORS = ("grok", "grok-bot", "hermes")
 PACKAGED = "/usr/bin/omarchy-agent-usage-update"
 TIMEOUT = 45
+# write_atomic's temporaries; anything this old was left by a killed run.
+TMP_RE = re.compile(r"^\.[A-Za-z0-9._-]{1,80}\.[0-9a-f]{16}\.tmp$")
+STALE_TMP_SECONDS = 600
+
+# The collector running right now, so a SIGTERM can take it down too.
+_child: dict[str, subprocess.Popen | None] = {"proc": None}
+
+
+def on_terminate(signum: int, _frame) -> None:
+    """The shell restarting sends SIGTERM. Python's default would exit on the
+    spot and skip write_atomic's cleanup, leaving a .tmp behind; raising
+    SystemExit unwinds through it instead."""
+    proc = _child["proc"]
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            pass
+    raise SystemExit(128 + signum)
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -51,6 +71,23 @@ def open_dir_chain(parts: list[str]) -> int:
     except BaseException:
         os.close(fd)
         raise
+
+
+def sweep_stale_tmps(dirfd: int) -> None:
+    """Remove our own temporaries that a killed run (or a crash) left behind."""
+    now = time.time()
+    for name in os.listdir(dirfd):
+        if not TMP_RE.fullmatch(name):
+            continue
+        try:
+            st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and now - st.st_mtime > STALE_TMP_SECONDS:
+            try:
+                os.unlink(name, dir_fd=dirfd)
+            except OSError:
+                pass
 
 
 def write_atomic(dirfd: int, name: str, data: bytes) -> None:
@@ -86,6 +123,7 @@ def run_capped(argv: list[str]) -> tuple[int, bytes]:
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    _child["proc"] = proc
     assert proc.stdout is not None and proc.stderr is not None
     os.set_blocking(proc.stdout.fileno(), False)
     os.set_blocking(proc.stderr.fileno(), False)
@@ -124,6 +162,7 @@ def run_capped(argv: list[str]) -> tuple[int, bytes]:
             out += proc.stdout.read(MAX_RECORD + 1) or b""
             err += proc.stderr.read(4096) or b""
             break
+    _child["proc"] = None
     if err.strip():
         sys.stderr.buffer.write(err[:2048] + b"\n")
     return proc.returncode or 0, out
@@ -138,6 +177,8 @@ def wanted(agent: str, except_ids: set[str], only: list[str]) -> bool:
 
 
 def main(argv: list[str]) -> int:
+    signal.signal(signal.SIGTERM, on_terminate)
+    signal.signal(signal.SIGHUP, on_terminate)
     flags: list[str] = []
     except_ids: set[str] = set()
     only: list[str] = []
@@ -162,6 +203,7 @@ def main(argv: list[str]) -> int:
             status = 1
     dirfd = open_dir_chain([".local", "state", "omarchy", "agents", "usage"])
     try:
+        sweep_stale_tmps(dirfd)
         for agent in COLLECTORS:
             if not wanted(agent, except_ids, only):
                 continue

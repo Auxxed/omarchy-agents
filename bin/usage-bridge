@@ -123,6 +123,10 @@ def write_atomic(dirfd: int, name: str, data: bytes) -> None:
         os.close(fd)
 
 
+# An ISO 8601 UTC timestamp as the collectors write it (datetime.isoformat()).
+ISO_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(\+00:00|Z)")
+
+
 def clip_str(value: Any, n: int = MAX_STR) -> str:
     s = str(value or "")
     if len(s) > n:
@@ -280,6 +284,9 @@ def sanitize_record(raw: Any) -> dict[str, Any] | None:
         "activeDates": [clip_str(d, 16) for d in (raw.get("activeDates") or [])[:366] if isinstance(d, str)],
         "modelUsage": models,
         "retryAdvised": raw.get("retryAdvised") is True,
+        # Set when the limits are a cached copy served under a status.
+        "limitsAsOf": raw["limitsAsOf"] if isinstance(raw.get("limitsAsOf"), str)
+        and ISO_TIME_RE.fullmatch(raw["limitsAsOf"]) else "",
         "scope": clip_str(raw.get("scope") or "device", 16),
     }
     if balance is not None:

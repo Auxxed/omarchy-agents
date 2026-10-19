@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.auxxed.agents",
   "name": "Agents",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "author": "auxxed",
   "license": "MIT",
-  "description": "Claude Code, Grok, Grok Bot, Hermes, Codex, and Fireworks usage in a native Omarchy bar panel, with launch for the selected agent and Hermes session, gateway and cron controls.",
+  "description": "Claude Code, Grok, Grok Bot, Hermes, Codex, and Fireworks usage in a native Omarchy bar panel (each agent gets a tab once it has been used), with launch for the selected agent and Hermes session, gateway and cron controls.",
   "kinds": [
     "bar-widget"
   ],

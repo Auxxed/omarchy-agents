@@ -589,6 +589,11 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
     fallback = usable_cached_limits(cached)
     fallback_tier = str(cached.get("tierLabel") or "")
     fallback_balance = cached.get("balance") if isinstance(cached.get("balance"), dict) else None
+    # Cached limits served under a status (sign-in expired, API down) are only
+    # as fresh as this; main() passes it on so the panel can say so.
+    fetched_ms = number(cached.get("fetchedAtMs"))
+    if fallback and fetched_ms > 0:
+        result["limitsAsOf"] = dt.datetime.fromtimestamp(fetched_ms / 1000, dt.timezone.utc).isoformat()
 
     login = oauth_login(home)
     if login is None:
@@ -704,6 +709,8 @@ def main() -> int:
     }
     if limits.get("retryAdvised"):
         record["retryAdvised"] = True
+    if limits["usageStatusText"] and limits["limits"] and limits.get("limitsAsOf"):
+        record["limitsAsOf"] = limits["limitsAsOf"]
     if limits.get("balance") is not None:
         record["balance"] = limits["balance"]
     record.update(stats)

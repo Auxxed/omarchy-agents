@@ -281,6 +281,9 @@ Item {
       // Rate limits and balances stay per-account and are never merged
       // across devices.
       limits: Array.isArray(record.limits) ? record.limits : [],
+      // Set when the limits are a cached copy shown under a status (sign-in
+      // expired, API down): the panel says how old they are.
+      limitsAsOf: String(record.limitsAsOf || ""),
       tierLabel: String(record.tierLabel || ""),
       balance: balanceValue(record.balance),
 
