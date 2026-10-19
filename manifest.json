@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "id": "io.github.auxxed.agents",
-  "name": "Agents",
-  "version": "1.4.0",
+  "name": "Agent Gauge",
+  "version": "1.4.1",
   "author": "auxxed",
   "license": "MIT",
   "description": "Claude Code, Grok, Grok Bot, Hermes, Codex, and Fireworks usage in a native Omarchy bar panel (each agent gets a tab once it has been used): limit meters with pace, an alert when a limit runs high, launch for the selected agent, and Hermes session, gateway and cron controls.",
@@ -14,7 +14,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Agents",
+    "displayName": "Agent Gauge",
     "description": "One bar icon and one panel: rate-limit meters with a pace mark and where each window is heading, today, the last week, and the all-time model breakdown for every subscription. One notification when a limit crosses alertPercent.",
     "category": "Developer Tools",
     "aliases": [

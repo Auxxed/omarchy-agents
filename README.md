@@ -1,4 +1,4 @@
-# Agents
+# Agent Gauge
 
 A bar widget for Omarchy Quattro that shows usage and limits for the coding
 agents on this machine, and can launch the one you have selected.
@@ -34,8 +34,8 @@ The widget lands on the right of the bar. Move it with:
 omarchy bar move io.github.auxxed.agents --section right
 ```
 
-If the built-in Agents widget is still enabled, disable it so you do not get
-two icons:
+Omarchy ships its own Agents widget (`omarchy.agents`). If it is still
+enabled, disable it so you do not get two icons:
 
 ```sh
 omarchy plugin disable omarchy.agents
