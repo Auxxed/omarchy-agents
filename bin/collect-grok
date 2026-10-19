@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 # omarchy:summary=Print the Grok usage record as JSON
 # omarchy:args=[--force] [--limits-only]
 # omarchy:hidden=true
@@ -39,6 +39,14 @@ MAX_AUTH_BYTES = 65536
 MAX_HTTP_BYTES = 1_048_576
 HTTP_TIMEOUT = 12
 PROBE_MIN_INTERVAL_SECONDS = 15
+MAX_CACHE_BYTES = 1_048_576
+MAX_SUMMARY_BYTES = 65536
+# A turn_completed row is small; a longer line is tool output and skipped.
+MAX_LINE_BYTES = 1_048_576
+# After an HTTP 429 the billing host is left alone this long, or for its
+# Retry-After when that is longer (capped at an hour).
+RATE_LIMIT_SECONDS = 300
+MAX_RATE_LIMIT_SECONDS = 3600
 
 PLAN_LABELS = {
     "GrokPro": "SuperGrok",
@@ -70,9 +78,17 @@ def grok_home() -> Path:
 
 
 def cache_root() -> Path:
-    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    """The shared agent-usage cache, 0700. A link or someone else's directory
+    at that path is refused rather than written through."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    root = os.path.join(base, "omarchy", "agent-usage")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise PermissionError(f"{root} is not a private directory")
+    if st.st_mode & 0o077:
+        os.chmod(root, 0o700)
+    return Path(root)
 
 
 def date_string(value: dt.date | None = None) -> str:
@@ -136,46 +152,86 @@ def empty_stats() -> dict[str, Any]:
     }
 
 
-def read_bounded_json(path: Path, max_bytes: int) -> dict[str, Any] | None:
+def open_regular(path: Path) -> tuple[int, os.stat_result] | None:
+    """A read-only descriptor for a regular file of ours at path, or None.
+    Never follows a final link and never blocks on a FIFO."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return None
     except OSError:
         return None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
-            return None
-        if st.st_size > max_bytes:
+            os.close(fd)
             return None
         os.set_blocking(fd, True)
+        return fd, st
+    except OSError:
+        os.close(fd)
+        return None
+
+
+def read_bounded(path: Path, max_bytes: int) -> tuple[bytes, os.stat_result] | None:
+    opened = open_regular(path)
+    if opened is None:
+        return None
+    fd, st = opened
+    try:
+        if st.st_size > max_bytes:
+            return None
         data = b""
         while len(data) <= max_bytes:
             chunk = os.read(fd, min(65536, max_bytes + 1 - len(data)))
             if not chunk:
                 break
             data += chunk
-        if len(data) > max_bytes:
-            return None
-        parsed = json.loads(data.decode("utf-8"))
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
+        return (data, st) if len(data) <= max_bytes else None
+    except OSError:
         return None
     finally:
         os.close(fd)
 
 
-def read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+def read_bounded_json(path: Path, max_bytes: int) -> dict[str, Any] | None:
+    read = read_bounded(path, max_bytes)
+    if read is None:
         return None
-    return data if isinstance(data, dict) else None
+    try:
+        parsed = json.loads(read[0].decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def bounded_lines(fd: int, max_line: int):
+    """Lines of the open file, each at most max_line bytes; longer lines are
+    skipped whole without ever being held in memory."""
+    buf = b""
+    skipping = False
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            if buf and not skipping:
+                yield buf
+            return
+        buf += chunk
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                if len(buf) > max_line:
+                    buf = b""
+                    skipping = True
+                break
+            line, buf = buf[:nl], buf[nl + 1:]
+            if skipping:
+                skipping = False
+                continue
+            if len(line) <= max_line:
+                yield line
 
 
 def session_kind(session_dir: Path) -> str:
-    summary = read_json(session_dir / "summary.json") or {}
+    summary = read_bounded_json(session_dir / "summary.json", MAX_SUMMARY_BYTES) or {}
     return str(summary.get("session_kind") or "")
 
 
@@ -221,52 +277,56 @@ def extract_usage(update: dict[str, Any]) -> dict[str, Any] | None:
 def scan_updates(path: Path) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     seen: set[str] = set()
+    opened = open_regular(path)
+    if opened is None:
+        return turns
+    fd, _st = opened
     try:
-        if path.is_symlink():
-            return turns
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line_number, line in enumerate(handle, 1):
-                if "turn_completed" not in line:
+        for line_number, raw_line in enumerate(bounded_lines(fd, MAX_LINE_BYTES), 1):
+            if b"turn_completed" not in raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="replace")
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            params = entry.get("params")
+            if not isinstance(params, dict):
+                continue
+            update = params.get("update") or {}
+            if not isinstance(update, dict):
+                continue
+            kind = update.get("sessionUpdate") or update.get("event_name")
+            if kind != "turn_completed":
+                continue
+            usage = extract_usage(update)
+            if usage is None:
+                continue
+            prompt_id = str(update.get("prompt_id") or f"{path}:{line_number}")
+            if prompt_id.startswith("task-completed") or prompt_id in seen:
+                continue
+            seen.add(prompt_id)
+            meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+            day = local_date_from_timestamp(entry.get("timestamp") or meta.get("agentTimestampMs"))
+            for model, bucket in model_turns(usage):
+                input_tokens, output_tokens, cache_read, cache_write = turn_usage(bucket)
+                if not (input_tokens or output_tokens or cache_read or cache_write):
                     continue
-                try:
-                    entry = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(entry, dict):
-                    continue
-                params = entry.get("params")
-                if not isinstance(params, dict):
-                    continue
-                update = params.get("update") or {}
-                if not isinstance(update, dict):
-                    continue
-                kind = update.get("sessionUpdate") or update.get("event_name")
-                if kind != "turn_completed":
-                    continue
-                usage = extract_usage(update)
-                if usage is None:
-                    continue
-                prompt_id = str(update.get("prompt_id") or f"{path}:{line_number}")
-                if prompt_id.startswith("task-completed") or prompt_id in seen:
-                    continue
-                seen.add(prompt_id)
-                meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
-                day = local_date_from_timestamp(entry.get("timestamp") or meta.get("agentTimestampMs"))
-                for model, bucket in model_turns(usage):
-                    input_tokens, output_tokens, cache_read, cache_write = turn_usage(bucket)
-                    if not (input_tokens or output_tokens or cache_read or cache_write):
-                        continue
-                    turns.append({
-                        "id": prompt_id,
-                        "day": day,
-                        "model": model,
-                        "inputTokens": input_tokens,
-                        "outputTokens": output_tokens,
-                        "cacheReadInputTokens": cache_read,
-                        "cacheCreationInputTokens": cache_write,
-                    })
+                turns.append({
+                    "id": prompt_id,
+                    "day": day,
+                    "model": model,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "cacheReadInputTokens": cache_read,
+                    "cacheCreationInputTokens": cache_write,
+                })
     except OSError as exc:
         print(f"Ignoring unreadable Grok updates file {path}: {exc}", file=sys.stderr)
+    finally:
+        os.close(fd)
     return turns
 
 
@@ -294,7 +354,7 @@ def scan_sessions(sessions_root: Path) -> dict[str, Any]:
         walker = sessions_root.rglob("updates.jsonl")
 
     for path in walker:
-        if not path.is_file() or path.is_symlink():
+        if path.is_symlink():
             continue
         session_dir = path.parent
         if is_subagent(session_kind(session_dir)):
@@ -351,14 +411,17 @@ def scan_cache_paths(sessions_root: Path) -> tuple[Path, Path]:
 
 
 def read_fresh_scan(path: Path, max_age_seconds: float) -> dict[str, Any] | None:
-    if max_age_seconds <= 0 or not path.exists():
+    if max_age_seconds <= 0:
+        return None
+    read = read_bounded(path, MAX_CACHE_BYTES)
+    if read is None:
+        return None
+    data, st = read
+    if not (0 <= time.time() - st.st_mtime <= max_age_seconds):
         return None
     try:
-        age = time.time() - path.stat().st_mtime
-        if not (0 <= age <= max_age_seconds):
-            return None
-        cached = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        cached = json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):
         return None
     if not isinstance(cached, dict) or cached.get("scanDate") != date_string():
         return None
@@ -367,35 +430,61 @@ def read_fresh_scan(path: Path, max_age_seconds: float) -> dict[str, Any] | None
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    tmp = Path(tmp_name)
+    """Atomically replace path with payload, 0600 from the first byte. The
+    rename replaces a link planted at path instead of writing through it."""
+    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
     try:
+        os.fchmod(handle_fd, 0o600)
         with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
-        tmp.chmod(0o600)
-        tmp.replace(path)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
 
 
+def open_lock(path: Path) -> int:
+    """The lock file, opened without truncating or following a link."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        os.close(fd)
+        raise PermissionError(f"{path} is not a lock file of ours")
+    return fd
+
+
 def cached_scan(sessions_root: Path, max_age_seconds: float) -> dict[str, Any]:
-    cache_file, lock_file = scan_cache_paths(sessions_root)
+    try:
+        cache_file, lock_file = scan_cache_paths(sessions_root)
+    except OSError as exc:
+        print(f"omarchy-agent-usage-grok: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+        return scan_sessions(sessions_root)
     cached = read_fresh_scan(cache_file, max_age_seconds)
     if cached is not None:
         return cached
     try:
-        with lock_file.open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            cached = read_fresh_scan(cache_file, max_age_seconds)
-            if cached is not None:
-                return cached
-            summary = scan_sessions(sessions_root)
-            write_json(cache_file, {"scanDate": date_string(), "stats": summary})
-            return summary
-    except Exception as exc:
+        lock = open_lock(lock_file)
+    except OSError as exc:
         print(f"omarchy-agent-usage-grok: cache unavailable ({exc}); scanning directly", file=sys.stderr)
         return scan_sessions(sessions_root)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cached = read_fresh_scan(cache_file, max_age_seconds)
+        if cached is not None:
+            return cached
+        summary = scan_sessions(sessions_root)
+        try:
+            write_json(cache_file, {"scanDate": date_string(), "stats": summary})
+        except OSError as exc:
+            print(f"omarchy-agent-usage-grok: scan cache not written ({exc})", file=sys.stderr)
+        return summary
+    finally:
+        os.close(lock)
 
 
 class SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -576,6 +665,18 @@ def usable_cached_limits(cached: dict[str, Any]) -> list[dict[str, Any]]:
     return entries if isinstance(entries, list) else []
 
 
+def retry_after_seconds(headers: Any) -> int:
+    """Seconds a 429 asks us to wait: Retry-After when it is a plain number,
+    never less than RATE_LIMIT_SECONDS nor more than an hour."""
+    raw = ""
+    try:
+        raw = str(headers.get("Retry-After") or "").strip() if headers is not None else ""
+    except Exception:
+        raw = ""
+    wait = int(raw) if raw.isdigit() and len(raw) <= 6 else 0
+    return max(RATE_LIMIT_SECONDS, min(MAX_RATE_LIMIT_SECONDS, wait))
+
+
 def collect_limits(home: Path, force: bool) -> dict[str, Any]:
     result: dict[str, Any] = {
         "limits": [],
@@ -584,8 +685,11 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
         "authHelpText": AUTH_HELP,
         "balance": None,
     }
-    probe_cache = cache_root() / "grok-limits.json"
-    cached = read_json(probe_cache) or {}
+    try:
+        probe_cache: Path | None = cache_root() / "grok-limits.json"
+    except OSError:
+        probe_cache = None
+    cached = (read_bounded_json(probe_cache, MAX_CACHE_BYTES) if probe_cache else None) or {}
     fallback = usable_cached_limits(cached)
     fallback_tier = str(cached.get("tierLabel") or "")
     fallback_balance = cached.get("balance") if isinstance(cached.get("balance"), dict) else None
@@ -606,13 +710,14 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
             result["usageStatusText"] = "Waiting for auth"
         return result
 
+    # Expired sign-ins do not fix themselves in 30 seconds, so no quick
+    # retry is advised; the normal refresh picks up a new login.
     if token_expired(login):
         result["limits"] = fallback
         result["tierLabel"] = fallback_tier
         result["balance"] = fallback_balance
         result["usageStatusText"] = "Sign-in expired"
         result["authHelpText"] = AUTH_HELP
-        result["retryAdvised"] = True
         return result
 
     token = str(login.get("key") or "").strip()
@@ -626,6 +731,18 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
     if user_id:
         headers["x-userid"] = user_id
 
+    # A 429 earlier: the host asked to be left alone, so even a forced
+    # refresh waits, and no quick retry is advised.
+    backoff_until = number(cached.get("backoffUntilMs")) / 1000.0
+    if backoff_until > time.time():
+        result["limits"] = fallback
+        result["tierLabel"] = fallback_tier
+        result["balance"] = fallback_balance
+        result["authHelpText"] = ""
+        minutes = max(1, round((backoff_until - time.time()) / 60))
+        result["usageStatusText"] = f"Rate limited, next try in {minutes}m"
+        return result
+
     if not force:
         fetched_at = number(cached.get("fetchedAtMs")) / 1000.0
         if fetched_at and 0 <= time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS and fallback:
@@ -638,6 +755,19 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
     try:
         payload = fetch_proxy_json(BILLING_URL, headers)
     except urllib.error.HTTPError as error:
+        if error.code == 429:
+            wait = retry_after_seconds(error.headers)
+            if probe_cache is not None:
+                try:
+                    write_json(probe_cache, {**cached, "backoffUntilMs": round((time.time() + wait) * 1000)})
+                except OSError:
+                    pass
+            result["limits"] = fallback
+            result["tierLabel"] = fallback_tier
+            result["balance"] = fallback_balance
+            result["authHelpText"] = ""
+            result["usageStatusText"] = f"Rate limited, next try in {max(1, round(wait / 60))}m"
+            return result
         if error.code in (401, 403):
             result["limits"] = fallback
             result["tierLabel"] = fallback_tier
@@ -668,15 +798,16 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
 
     result.update(parsed)
     result["authHelpText"] = ""
-    try:
-        write_json(probe_cache, {
-            "fetchedAtMs": round(time.time() * 1000),
-            "limits": result["limits"],
-            "tierLabel": result["tierLabel"],
-            "balance": result["balance"],
-        })
-    except Exception:
-        pass
+    if probe_cache is not None:
+        try:
+            write_json(probe_cache, {
+                "fetchedAtMs": round(time.time() * 1000),
+                "limits": result["limits"],
+                "tierLabel": result["tierLabel"],
+                "balance": result["balance"],
+            })
+        except OSError:
+            pass
     return result
 
 

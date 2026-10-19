@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 # omarchy:summary=Print the Hermes usage record as JSON
 # omarchy:args=[--force] [--limits-only]
 # omarchy:hidden=true
@@ -42,6 +42,11 @@ MAX_DB_BYTES = 256 * 1024 * 1024
 MAX_STATE_BYTES = 65536
 MAX_JOBS_BYTES = 1_048_576
 MAX_JOBS = 500
+MAX_CACHE_BYTES = 1_048_576
+# After an HTTP 429 the Portal is left alone this long, or for its
+# Retry-After when that is longer (capped at an hour).
+RATE_LIMIT_SECONDS = 300
+MAX_RATE_LIMIT_SECONDS = 3600
 MAX_RECENT_SESSIONS = 6
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -58,9 +63,17 @@ def hermes_home() -> Path:
 
 
 def cache_root() -> Path:
-    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    """The shared agent-usage cache, 0700. A link or someone else's directory
+    at that path is refused rather than written through."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    root = os.path.join(base, "omarchy", "agent-usage")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise PermissionError(f"{root} is not a private directory")
+    if st.st_mode & 0o077:
+        os.chmod(root, 0o700)
+    return Path(root)
 
 
 def date_string(value: dt.date | None = None) -> str:
@@ -166,25 +179,35 @@ def read_bounded_json(path: Path, max_bytes: int) -> dict[str, Any] | None:
         os.close(fd)
 
 
-def read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    tmp = Path(tmp_name)
+    """Atomically replace path with payload, 0600 from the first byte. The
+    rename replaces a link planted at path instead of writing through it."""
+    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
     try:
+        os.fchmod(handle_fd, 0o600)
         with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
-        tmp.chmod(0o600)
-        tmp.replace(path)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
+
+
+def retry_after_seconds(headers: Any) -> int:
+    """Seconds a 429 asks us to wait: Retry-After when it is a plain number,
+    never less than RATE_LIMIT_SECONDS nor more than an hour."""
+    raw = ""
+    try:
+        raw = str(headers.get("Retry-After") or "").strip() if headers is not None else ""
+    except Exception:
+        raw = ""
+    wait = int(raw) if raw.isdigit() and len(raw) <= 6 else 0
+    return max(RATE_LIMIT_SECONDS, min(MAX_RATE_LIMIT_SECONDS, wait))
 
 
 def open_state_db(path: Path) -> tuple[sqlite3.Connection, int] | None:
@@ -657,8 +680,11 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
         "authHelpText": AUTH_HELP,
         "balance": None,
     }
-    probe_cache = cache_root() / "hermes-limits.json"
-    cached = read_json(probe_cache) or {}
+    try:
+        probe_cache: Path | None = cache_root() / "hermes-limits.json"
+    except OSError:
+        probe_cache = None
+    cached = (read_bounded_json(probe_cache, MAX_CACHE_BYTES) if probe_cache else None) or {}
     fallback_limits = cached.get("limits") if isinstance(cached.get("limits"), list) else []
     fallback_tier = str(cached.get("tierLabel") or "")
     fallback_balance = cached.get("balance") if isinstance(cached.get("balance"), dict) else None
@@ -688,8 +714,19 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
         result["tierLabel"] = "Free"
         return result
 
+    # Expired sign-ins do not fix themselves in 30 seconds, so no quick
+    # retry is advised; the normal refresh picks up a new login.
     if token_expired(login):
-        return restore_fallback("Sign-in expired", retry=True)
+        return restore_fallback("Sign-in expired")
+
+    # A 429 earlier: the Portal asked to be left alone, so even a forced
+    # refresh waits, and no quick retry is advised.
+    backoff_until = number(cached.get("backoffUntilMs")) / 1000.0
+    if backoff_until > time.time():
+        minutes = max(1, round((backoff_until - time.time()) / 60))
+        restore_fallback(f"Rate limited, next try in {minutes}m")
+        result["authHelpText"] = ""
+        return result
 
     if not force:
         fetched_at = number(cached.get("fetchedAtMs")) / 1000.0
@@ -706,6 +743,16 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
     try:
         payload = fetch_account(token)
     except urllib.error.HTTPError as error:
+        if error.code == 429:
+            wait = retry_after_seconds(error.headers)
+            if probe_cache is not None:
+                try:
+                    write_json(probe_cache, {**cached, "backoffUntilMs": round((time.time() + wait) * 1000)})
+                except OSError:
+                    pass
+            restore_fallback(f"Rate limited, next try in {max(1, round(wait / 60))}m")
+            result["authHelpText"] = ""
+            return result
         if error.code in (401, 403):
             return restore_fallback("Sign-in expired")
         return restore_fallback("Nous Portal unavailable", retry=True)
@@ -715,15 +762,16 @@ def collect_limits(home: Path, force: bool) -> dict[str, Any]:
     parsed = parse_account(payload)
     result.update(parsed)
     result["authHelpText"] = ""
-    try:
-        write_json(probe_cache, {
-            "fetchedAtMs": int(time.time() * 1000),
-            "limits": result["limits"],
-            "tierLabel": result["tierLabel"],
-            "balance": result["balance"],
-        })
-    except Exception:
-        pass
+    if probe_cache is not None:
+        try:
+            write_json(probe_cache, {
+                "fetchedAtMs": int(time.time() * 1000),
+                "limits": result["limits"],
+                "tierLabel": result["tierLabel"],
+                "balance": result["balance"],
+            })
+        except OSError:
+            pass
     return result
 
 

@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Usage.js" as U
 
 Panel {
   id: root
@@ -66,24 +67,13 @@ Panel {
     && balance.remaining / balance.funded <= 0.1
   readonly property bool alarming: (!!headline && headline.percent >= 0.9) || balanceAlarming
 
-  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
+  function clamp(v, lo, hi) { return U.clamp(v, lo, hi) }
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
   // Host-owned sinks (PanelHero, Button, tooltips) render as AutoText.
-  function plain(value, maxLen) {
-    var s = String(value || "")
-    s = s.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, "")
-    s = s.replace(/[<>&]/g, "")
-    var n = maxLen || 80
-    if (s.length > n) s = s.substring(0, n)
-    return s
-  }
+  function plain(value, maxLen) { return U.plain(value, maxLen) }
 
-  function safeId(value) {
-    var s = String(value || "")
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(s) || s.indexOf("..") >= 0) return ""
-    return s
-  }
+  function safeId(value) { return U.safeId(value) }
 
   function selectProvider(index) {
     if (providers.length === 0) return
@@ -92,8 +82,58 @@ Panel {
   }
 
   function refreshNow() {
-    usage.refreshAll(true)
+    leaderUsage().refreshAll(true)
   }
+
+  // Several bars, one widget each. The first instance is the leader: it
+  // runs the collectors, owns the IPC target and sends limit alerts; the
+  // others read the records it writes.
+  function leaderPanel() {
+    var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : null
+    return items && items.length && items[0] ? items[0] : root
+  }
+  function isLeader() { return leaderPanel() === root }
+  function leaderUsage() {
+    var lead = leaderPanel()
+    return lead && lead.usageModel ? lead.usageModel : usage
+  }
+  readonly property var usageModel: usage
+  // Settled once siblings have registered, so only one IpcHandler is live.
+  property bool ipcOwner: false
+
+  // IPC opens the panel on the focused monitor, through the shell.
+  function viaShell(action) {
+    var sh = bar ? bar.shell : null
+    if (!sh || typeof sh[action] !== "function") return false
+    if (action === "hide") sh.hide(moduleName)
+    else sh[action](moduleName, "{}")
+    return true
+  }
+
+  // alertPercent: one notification when a limit window crosses it; 0 turns
+  // alerts off. A window already past it when the shell starts stays quiet.
+  readonly property int alertPercent: {
+    var raw = settings ? settings.alertPercent : undefined
+    var n = Math.round(Number(raw === undefined || raw === null || raw === "" ? 90 : raw))
+    return isFinite(n) && n >= 0 && n <= 100 ? n : 90
+  }
+  property var limitState: ({})
+
+  function checkLimitAlerts() {
+    var result = U.limitCrossings(limitState, providers, alertPercent)
+    limitState = result.state
+    if (!isLeader()) return
+    for (var i = 0; i < result.alerts.length; i++) {
+      var alert = result.alerts[i]
+      var w = alert.window
+      var when = U.resetLine(w, Date.now(), true)
+      Util.execArgv(["/usr/bin/omarchy-notification-send", "-g", button.text, "-u", "normal",
+        alert.providerName + " " + w.title.toLowerCase() + " limit at " + Math.round(U.clamp(w.percent, 0, 1) * 100) + "%",
+        when !== "" ? when + "." : "Close to the limit."])
+    }
+  }
+
+  onProvidersChanged: checkLimitAlerts()
 
   function launchAgent() {
     // Right-click opens the subscription currently shown in the panel
@@ -101,20 +141,20 @@ Panel {
     // selection yet, falls through to the stock picker.
     var id = root.provider ? root.safeId(root.provider.providerId) : ""
     if (id !== "")
-      Util.execArgv([root.launchHelper, id])
+      Util.execArgv(["/usr/bin/bash", root.launchHelper, id])
     else
       Util.execArgv(["/usr/bin/omarchy-agent", "--pick"])
     root.close()
   }
 
   function launchHermesApp() {
-    Util.execArgv([root.launchHelper, "hermes-desktop"])
+    Util.execArgv(["/usr/bin/bash", root.launchHelper, "hermes-desktop"])
     root.close()
   }
 
   function resumeHermesSession(session) {
     if (!session || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(session.id)) return
-    Util.execArgv([root.launchHelper, "hermes-session", session.id, session.source === "desktop" ? "desktop" : "cli"])
+    Util.execArgv(["/usr/bin/bash", root.launchHelper, "hermes-session", session.id, session.source === "desktop" ? "desktop" : "cli"])
     root.close()
   }
 
@@ -123,289 +163,50 @@ Panel {
   function toggleHermesPause() {
     if (!root.hermes || hermesControl.running) return
     root.hermesControlPending = true
-    hermesControl.command = [root.launchHelper, root.hermes.paused ? "hermes-unpause" : "hermes-pause"]
+    hermesControl.command = ["/usr/bin/bash", root.launchHelper, root.hermes.paused ? "hermes-unpause" : "hermes-pause"]
     hermesControl.running = true
   }
 
-  function hermesStatusText(h) {
-    if (!h) return ""
-    var parts = [h.gatewayRunning ? "Gateway running" : "Gateway stopped"]
-    if (h.gatewayRunning && h.activeAgents > 0)
-      parts.push(h.activeAgents + " agent" + (h.activeAgents === 1 ? "" : "s") + " working")
-    if (h.cronJobs > 0) {
-      var cron = h.cronActive + " cron job" + (h.cronActive === 1 ? "" : "s")
-      var next = h.cronNextRunAt !== "" ? new Date(h.cronNextRunAt).getTime() - root.nowMs : -1
-      if (!h.paused && next > 0) cron += ", next in " + formatDuration(next)
-      parts.push(cron)
-    }
-    if (h.cronFailing > 0) parts.push(h.cronFailing + " failing")
-    if (h.runningWorkers > 0)
-      parts.push(h.runningWorkers + " worker" + (h.runningWorkers === 1 ? "" : "s") + " running")
-    return parts.join(" · ")
-  }
+  function hermesStatusText(h) { return U.hermesStatusText(h, root.nowMs) }
 
-  // Hermes records lifecycle reasons (tui_close, ws_disconnect,
-  // compression…), not success or failure, so they are shown as-is.
-  function hermesLastEndedText(h) {
-    if (!h || h.lastEndReason === "") return ""
-    var when = relativeTime(h.lastEndedAt)
-    return "Last session ended" + (when !== "" ? " " + when : "") + ": " + h.lastEndReason.replace(/_/g, " ")
-  }
+  function hermesLastEndedText(h) { return U.hermesLastEndedText(h, root.nowMs) }
 
-  function hermesCostText(h) {
-    if (!h || (h.todayCostUsd <= 0 && h.weekCostUsd <= 0)) return ""
-    return formatMoney(h.todayCostUsd, "USD") + " today · " + formatMoney(h.weekCostUsd, "USD") + " this week"
-  }
+  function hermesCostText(h) { return U.hermesCostText(h) }
 
-  function relativeTime(iso) {
-    var ms = new Date(String(iso || "")).getTime()
-    if (!isFinite(ms)) return ""
-    var ago = root.nowMs - ms
-    if (ago < 60000) return "now"
-    return formatDuration(ago).split(" ")[0] + " ago"
-  }
-
-  function sessionMeta(session) {
-    if (!session) return ""
-    var parts = []
-    var when = relativeTime(session.lastActivityAt)
-    if (when !== "") parts.push(when)
-    parts.push(session.messages + " msg")
-    if (session.model !== "") parts.push(usage.friendlyModelName(session.model))
-    return parts.join(" · ")
-  }
+  function sessionMeta(session) { return U.sessionMeta(session, root.nowMs) }
 
   // Hover summary for the bar icon: the fullest window of every agent.
-  function barTooltip() {
-    var parts = []
-    for (var i = 0; i < providers.length && parts.length < 6; i++) {
-      var w = bindingWindow(providers[i])
-      var name = plain(providers[i].providerName, 20)
-      if (w) parts.push(name + " " + Math.round(clamp(w.percent, 0, 1) * 100) + "%")
-      else if (providers[i].balance) parts.push(name + " " + formatMoney(providers[i].balance.remaining, providers[i].balance.currency))
-    }
-    return plain(parts.join(" · "), 160)
-  }
+  function barTooltip() { return U.barTooltip(providers) }
 
-  // ---------------------------------------------------------------- limits
-  //
-  // Both providers report the same two shapes: a short rolling session window
-  // and a long weekly one. Everything below normalizes them into one record so
-  // the meters and the hero speak a single language.
+  function limitWindows(p) { return U.limitWindows(p) }
 
-  // Claude spells its windows out ("Session (5-hour)"), Codex abbreviates
-  // them ("5h window", "30m window"). Both have to land on the same record.
-  function windowIsLong(text) {
-    return text.indexOf("week") >= 0 || text.indexOf("7-day") >= 0 || text.indexOf("seven") >= 0
-      || text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0
-  }
+  // The fullest window decides how much room is left.
+  function bindingWindow(p) { return U.bindingWindow(p) }
 
-  function windowSpanMs(label) {
-    var text = String(label || "").toLowerCase()
-    if (text.indexOf("month") >= 0 || text.indexOf("30-day") >= 0) return 30 * 24 * 3600 * 1000
-    if (windowIsLong(text)) return 7 * 24 * 3600 * 1000
-    var hours = text.match(/(\d+)\s*-?\s*h(?:our)?\b/)
-    if (hours) return Number(hours[1]) * 3600 * 1000
-    var minutes = text.match(/(\d+)\s*-?\s*m(?:in(?:ute)?s?)?\b/)
-    if (minutes) return Number(minutes[1]) * 60 * 1000
-    return 0
-  }
+  function busiestWindow() { return U.busiestWindow(providers) }
 
-  function windowTitle(label) {
-    var text = String(label || "").toLowerCase()
-    if (text.indexOf("month") >= 0) return "Monthly"
-    if (windowIsLong(text)) return "Weekly"
-    if (text.indexOf("session") >= 0 || windowSpanMs(label) > 0) return "Session"
-    var plain = String(label || "").replace(/\s*\(.*\)\s*/, "").trim()
-    return plain === "" ? "Limit" : plain
-  }
+  // "2d 4h ago" while the limits are a cached copy.
+  function limitsAge(p) { return U.limitsAge(p, root.nowMs) }
 
-  // A collector that already knows which window a limit belongs to says so,
-  // and that beats reading it back out of the label: a model-scoped limit is
-  // titled after its model, and a name like "Opus 5 (1M context)" would parse
-  // as a one-minute window.
-  function limitWindow(label, percent, resetAt, title) {
-    return {
-      title: String(title || "") !== "" ? String(title) : windowTitle(label),
-      percent: Number(percent),
-      resetAt: String(resetAt || "")
-    }
-  }
+  function formatDuration(ms) { return U.formatDuration(ms) }
 
-  function limitWindows(p) {
-    if (!p) return []
-    var out = []
-    var list = p.limits || []
-    for (var i = 0; i < list.length; i++) {
-      var entry = list[i] || {}
-      var percent = Number(entry.percent)
-      if (percent >= 0) out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
-    }
-    return out
-  }
+  function formatMoney(value, currency) { return U.formatMoney(value, currency) }
 
-  // The window that decides how much room is left — the fullest one, since
-  // that is what stops the next prompt.
-  function bindingWindow(p) {
-    var windows = limitWindows(p)
-    var best = null
-    for (var i = 0; i < windows.length; i++) {
-      if (!best || windows[i].percent > best.percent) best = windows[i]
-    }
-    return best
-  }
+  function balanceDetailText(b) { return U.balanceDetailText(b) }
 
-  function busiestWindow() {
-    var best = null
-    for (var i = 0; i < providers.length; i++) {
-      var w = bindingWindow(providers[i])
-      if (w && (!best || w.percent > best.percent)) best = w
-    }
-    return best
-  }
+  function heroMeta(p) { return U.heroMeta(p) }
 
-  function resetMsFor(w) {
-    if (!w || w.resetAt === "") return -1
-    var ms = new Date(w.resetAt).getTime()
-    return isFinite(ms) ? ms - root.nowMs : -1
-  }
+  function todayDate() { return U.todayDate(root.nowMs) }
 
-  // "LIMITS · AS OF 2D 4H AGO" while the limits are a cached copy.
-  function limitsAge(p) {
-    if (!p || String(p.limitsAsOf || "") === "") return ""
-    var at = Date.parse(p.limitsAsOf)
-    if (!isFinite(at)) return ""
-    return formatDuration(root.nowMs - at) + " ago"
-  }
+  function dayLabel(date, today) { return U.dayLabel(date, today) }
 
-  function formatDuration(ms) {
-    if (!(ms > 0)) return "now"
-    var minutes = Math.floor(ms / 60000)
-    var hours = Math.floor(minutes / 60)
-    var days = Math.floor(hours / 24)
-    if (days > 0) return days + "d " + (hours % 24) + "h"
-    if (hours > 0) return hours + "h " + (minutes % 60) + "m"
-    return Math.max(1, minutes) + "m"
-  }
+  function dayTooltip(day, today) { return U.dayTooltip(day, today, provider) }
 
-  // ---------------------------------------------------------------- balance
-  //
-  // Prepaid agents report a credit ledger instead of rate-limit windows: the
-  // record's balance object carries remaining, funded, and spent amounts.
+  function weekPeak(p) { return U.weekPeak(p) }
 
-  function currencyPrefix(currency) {
-    var code = String(currency || "USD").toUpperCase()
-    if (code === "USD") return "$"
-    if (code === "EUR") return "€"
-    if (code === "GBP") return "£"
-    return code + " "
-  }
+  function modelRows(p) { return U.modelRows(p) }
 
-  function formatMoney(value, currency) {
-    var amount = Number(value)
-    if (!isFinite(amount)) amount = 0
-    return currencyPrefix(currency) + amount.toFixed(2)
-  }
-
-  function balanceDetailText(b) {
-    if (!b || !(b.funded > 0)) return ""
-    var text = formatMoney(b.spent, b.currency) + " spent of " + formatMoney(b.funded, b.currency) + " funded"
-    if (b.estimated) text += " · estimated"
-    return text
-  }
-
-  // ---------------------------------------------------------------- content
-
-  // The plan you pay for, under the name of the tool it pays for. Limits live
-  // in their own section and a sign-in problem in the status box; the hero
-  // just says what this is, so the two never say the same thing twice.
-  function heroMeta(p) {
-    if (!p) return ""
-    var tier = String(p.tierLabel || "")
-    if (tier === "") return "Subscription"
-    return tier.charAt(0).toUpperCase() + tier.slice(1)
-  }
-
-  // Local calendar date, recomputed from nowMs so a panel left open across
-  // midnight moves the "Today" row with the clock.
-  function todayDate() {
-    var now = new Date(root.nowMs)
-    return now.getFullYear()
-      + "-" + String(now.getMonth() + 1).padStart(2, "0")
-      + "-" + String(now.getDate()).padStart(2, "0")
-  }
-
-  function dayName(date) {
-    var parsed = new Date(String(date || "") + "T00:00:00")
-    if (isNaN(parsed.getTime())) return String(date || "")
-    return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][parsed.getDay()]
-  }
-
-  function dayLabel(date, today) {
-    if (today) return "Today"
-    return dayName(date)
-  }
-
-  function dayTooltip(day, today) {
-    if (!day) return ""
-    var parsed = new Date(String(day.date) + "T00:00:00")
-    var label = isNaN(parsed.getTime())
-      ? String(day.date)
-      : dayName(day.date) + " " + (parsed.getMonth() + 1) + "/" + parsed.getDate()
-    var text = label + " · " + usage.formatTokenCount(Number(day.messageCount || 0)) + " tokens"
-    // Prompt and session counts only exist for today, so they ride along here
-    // instead of taking a section of their own. Billing-API agents never
-    // count prompts, and "0 prompts" would read as a quiet day, not a gap.
-    if (today && provider && provider.hasPromptStats !== false)
-      text += " · " + Number(provider.todayPrompts || 0) + " prompts · "
-        + Number(provider.todaySessions || 0) + " sessions"
-    return text
-  }
-
-  function weekPeak(p) {
-    var days = p ? (p.recentDays || []) : []
-    var peak = 0
-    for (var i = 0; i < days.length; i++) peak = Math.max(peak, Number(days[i].messageCount || 0))
-    return peak
-  }
-
-  function modelRows(p) {
-    var usageByModel = p ? (p.modelUsage || {}) : {}
-    var rows = []
-    for (var id in usageByModel) {
-      var bucket = usageByModel[id] || {}
-      var input = Number(bucket.inputTokens || 0)
-      var output = Number(bucket.outputTokens || 0)
-      var cacheRead = Number(bucket.cacheReadInputTokens || 0)
-      var cacheWrite = Number(bucket.cacheCreationInputTokens || 0)
-      rows.push({
-        name: usage.friendlyModelName(id),
-        total: input + output + cacheRead + cacheWrite,
-        input: input,
-        output: output,
-        cacheRead: cacheRead,
-        cacheWrite: cacheWrite
-      })
-    }
-    rows.sort(function(a, b) { return b.total - a.total })
-    return rows.slice(0, 4)
-  }
-
-  function modelTooltip(row) {
-    if (!row) return ""
-    return "In " + usage.formatTokenCount(row.input)
-      + " · out " + usage.formatTokenCount(row.output)
-      + " · cache read " + usage.formatTokenCount(row.cacheRead)
-      + " · cache write " + usage.formatTokenCount(row.cacheWrite)
-  }
-
-  // Only speaks up when the numbers cover more than this machine.
-  function footerText() {
-    if (usage.syncStatusText !== "") return usage.syncStatusText
-    if (provider && provider.syncEnabled && provider.syncDeviceCount > 0)
-      return "Merged from " + provider.syncDeviceCount + " device" + (provider.syncDeviceCount === 1 ? "" : "s")
-    return ""
-  }
+  function modelTooltip(row) { return U.modelTooltip(row) }
 
   // Agents that ship a white mark carry an `assets/<id>-light.svg` twin for
   // light surfaces; marks that work on both (Claude's brand-orange) ship one
@@ -449,13 +250,20 @@ Panel {
     cursorActive = false
     nowMs = Date.now()
     if (panelFlick) panelFlick.contentY = 0
-    usage.refreshLimits()
+    leaderUsage().refreshLimits()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   Main {
     id: usage
     settings: root.settings
+    leaderTest: root.isLeader
+  }
+
+  Timer {
+    interval: 1500
+    running: true
+    onTriggered: root.ipcOwner = root.isLeader()
   }
 
   // Cheap enough to keep running: it only re-evaluates text bindings, and a
@@ -472,17 +280,18 @@ Panel {
     running: false
     onExited: {
       root.hermesControlPending = false
-      usage.runUpdate("normal", ["hermes"])
+      root.leaderUsage().runUpdate("normal", ["hermes"])
     }
   }
 
   IpcHandler {
     target: root.ipcTarget
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
+    enabled: root.ipcOwner
+    function open(): void { if (!root.viaShell("summon")) root.open() }
+    function close(): void { if (!root.viaShell("hide")) root.close() }
+    function show(): void { open() }
+    function hide(): void { close() }
+    function toggle(): void { if (!root.viaShell("toggle")) root.toggle() }
   }
 
   function barPressed(buttonCode) {
@@ -496,7 +305,7 @@ Panel {
     anchors.fill: parent
     visible: root.barButton === button
     bar: root.bar
-    text: "󱚣"
+    text: "\u{F16A3}"
     active: root.alarming
     tooltipText: root.barTooltip()
     onPressed: function(buttonCode) { root.barPressed(buttonCode) }
@@ -508,7 +317,7 @@ Panel {
     anchors.fill: parent
     visible: root.barButton === percentButton
     bar: root.bar
-    text: "󱚣 " + root.barPercentText
+    text: "\u{F16A3} " + root.barPercentText
     active: root.alarming
     tooltipText: root.barTooltip()
     onPressed: function(buttonCode) { root.barPressed(buttonCode) }
@@ -911,7 +720,8 @@ Panel {
                 required property var modelData
                 width: limitsSection.width
                 window: modelData
-                opacity: root.limitsAge(root.provider) !== "" ? 0.55 : 1
+                stale: root.limitsAge(root.provider) !== ""
+                opacity: stale ? 0.55 : 1
               }
             }
           }
@@ -1000,18 +810,6 @@ Panel {
             }
           }
 
-          Text {
-            textFormat: Text.PlainText
-            visible: text !== ""
-            width: parent.width
-            topPadding: Style.space(2)
-            text: root.footerText()
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            horizontalAlignment: Text.AlignHCenter
-            elide: Text.ElideRight
-          }
         }
       }
     }
@@ -1097,12 +895,16 @@ Panel {
     }
   }
 
-  // A limit window: label and percentage, meter, and reset countdown.
+  // A limit window: label and percentage, meter with a pace mark, and the
+  // reset countdown with where the window is heading. A cached copy shows
+  // no pace: its percentage is older than the clock.
   component LimitRow: Column {
     id: limitRow
     property var window: null
+    property bool stale: false
 
     readonly property bool alarming: window && window.percent >= 0.9
+    readonly property var pace: stale ? null : U.pace(window, root.nowMs)
 
     spacing: Style.space(6)
 
@@ -1144,26 +946,27 @@ Panel {
       width: parent.width
       value: limitRow.window ? limitRow.window.percent : -1
       alarming: limitRow.alarming
+      mark: limitRow.pace ? limitRow.pace.expected : -1
     }
 
     Text {
       id: resetText
       textFormat: Text.PlainText
       width: parent.width
-      text: {
-        var remainingMs = root.resetMsFor(limitRow.window)
-        return remainingMs > 0 ? "Resets in " + root.formatDuration(remainingMs) : ""
-      }
-      color: root.dim
+      text: U.resetLine(limitRow.window, root.nowMs, !limitRow.stale)
+      color: limitRow.pace && limitRow.pace.runsOut ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
+      wrapMode: Text.WordWrap
     }
   }
 
-  // Rounded track showing the percentage of the allowance used.
+  // Rounded track showing the percentage of the allowance used. The mark,
+  // when set, is where an even pace through the window would be now.
   component Meter: Item {
     id: meter
     property real value: -1
+    property real mark: -1
     property bool alarming: false
     property real thickness: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
 
@@ -1189,6 +992,15 @@ Panel {
       }
     }
 
+    Rectangle {
+      visible: meter.mark > 0 && meter.mark < 1
+      width: Math.max(2, Math.round(meter.thickness * 0.5))
+      height: Math.round(meter.thickness * 2.4)
+      radius: width / 2
+      x: Math.round(meterTrack.width * root.clamp(meter.mark, 0, 1) - width / 2)
+      anchors.verticalCenter: meterTrack.verticalCenter
+      color: root.dim
+    }
   }
 
   // One row per day: label, bar, tokens. Today is picked out in full
@@ -1242,7 +1054,7 @@ Panel {
     Text {
       id: dayValue
       textFormat: Text.PlainText
-      text: usage.formatTokenCount(dayRow.day ? Number(dayRow.day.messageCount || 0) : 0)
+      text: U.formatTokenCount(dayRow.day ? Number(dayRow.day.messageCount || 0) : 0)
       color: dayRow.today ? root.foreground : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
@@ -1313,7 +1125,7 @@ Panel {
     Text {
       id: modelTokens
       textFormat: Text.PlainText
-      text: modelRow.row ? usage.formatTokenCount(modelRow.row.total) : ""
+      text: modelRow.row ? U.formatTokenCount(modelRow.row.total) : ""
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall

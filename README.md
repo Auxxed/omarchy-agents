@@ -66,6 +66,13 @@ its own timer (default 15 minutes).
 - **Right-click**: launch the selected agent in a terminal (Grok Bot focuses
   the desktop app). Agents start without auto-approve / `--yolo` flags
 - Hover the bar icon: the fullest limit (or balance) of every agent
+- Each limit meter has a **pace mark**: where an even burn through the
+  window would be by now. Under it, the reset countdown says where the
+  window is heading at the current rate: "~40% left at reset", or "Runs out
+  in 1d 9h at this pace" in the urgent color
+- One **notification** when a limit window crosses 90% (`alertPercent`). A
+  window already past it when the shell starts stays quiet, so a restart
+  never repeats an alert
 - In the panel: `h`/`l` switch subscription, `j`/`k` scroll, `r` or Enter
   refresh, Tab to the next bar panel, Esc closes
 - On the Hermes tab: `o` open the app, `1`–`6` resume a session
@@ -87,6 +94,12 @@ another one:
 
 ```sh
 omarchy bar set io.github.auxxed.agents defaultProvider hermes
+```
+
+Move the limit alert, or turn it off with `0`:
+
+```sh
+omarchy bar set io.github.auxxed.agents alertPercent 80 --json
 ```
 
 Show the fullest limit next to the bar icon. It uses the selected agent, or
@@ -112,7 +125,17 @@ omarchy bar set io.github.auxxed.agents providers '{
 ## Network
 
 Collectors only talk to these HTTPS hosts, with the already-signed-in token
-in an HTTP header (never in argv). Redirects off that host are refused.
+in an HTTP header (never in argv). Redirects off that host are refused. A
+host that answers HTTP 429 is left alone for five minutes (or its
+`Retry-After`, up to an hour), even by a forced refresh, and the panel shows
+the cached limits with "Rate limited, next try in Nm". Only a host that
+could not be reached at all earns a sooner retry: 30 s, then 1, 2, 4...
+minutes. An expired sign-in never does, since waiting does not fix it.
+
+Collectors never renew a sign-in. The Grok Bot app's token is only read,
+never refreshed: a refresh can retire the app's own refresh token and sign
+it out. When it expires the tab says "Sign-in expired" until the app renews
+it.
 
 | Collector | Endpoint | Credential |
 |---|---|---|
@@ -158,10 +181,32 @@ Claude, Codex, and Fireworks records in that same directory are written by
 Omarchy's packaged `omarchy-agent-usage-update`, not by this plugin.
 
 Collector caches (limits probes, Grok session scans) live under
-`~/.cache/omarchy/agent-usage/`.
+`~/.cache/omarchy/agent-usage/`, which the collectors keep at 0700. Every
+file this plugin reads there or in the agents' own folders is opened without
+following links, checked to be a regular file of yours, and read with a
+size cap; every file it writes is a fresh 0600 temporary renamed into
+place.
+
+On a multi-monitor bar each bar has its own copy of the widget, but only the
+first one runs the collectors, answers IPC (on the focused monitor) and
+sends alerts.
 
 The plugin does not write credentials, systemd units, sudoers, udev rules,
 or shell/Hyprland config.
+
+## Development
+
+```sh
+python3 -I tests/test_bridge.py      # the bridge, including the record contract
+python3 -I tests/test_collectors.py  # Grok, Hermes, Grok Bot in a throwaway HOME
+python3 -I tests/test_refresh.py     # the runner, against fake collectors
+python3 -I tests/test_hardening.py   # plain-text QML, argv-only processes
+node tests/test_usage.js             # Usage.js: windows, pace, alerts, formatting
+```
+
+None of them touch the network or your real usage files. CI runs them all.
+The panel's logic lives in `Usage.js`; `Panel.qml` and `Main.qml` only bind
+it to the shell.
 
 ## Remove
 

@@ -1,16 +1,23 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import "Usage.js" as U
 
-// The display side of agent usage. All extraction lives behind
-// omarchy-agent-usage-update, which writes one JSON record per agent into
-// the usage directory; this file only discovers those records, watches them
-// for changes, and optionally merges snapshots synced from other machines.
+// The data side of agent usage. Collectors (Omarchy's packaged
+// omarchy-agent-usage-update plus this plugin's Grok, Grok Bot and Hermes
+// collectors, all run by bin/refresh) write one JSON record per agent into
+// the usage directory; this file discovers those records, watches them for
+// changes and turns them into the providers the panel shows.
 Item {
   id: root
   visible: false
 
   property var settings: ({})
+  // Several bars mean several copies of this file. Only the leader runs the
+  // collectors; the others read the records it writes. The panel supplies
+  // the test, since only it can see its sibling widgets.
+  property var leaderTest: null
+  function leader() { return typeof leaderTest !== "function" || leaderTest() === true }
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string usageDir: home + "/.local/state/omarchy/agents/usage"
@@ -57,8 +64,7 @@ Item {
     for (var i = 0; i < lines.length; i++) {
       var name = lines[i].trim()
       var stem = name.slice(-5) === ".json" ? name.slice(0, -5) : name
-      if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(stem) && stem.indexOf("..") < 0)
-        ids.push(stem)
+      if (U.safeId(stem) !== "") ids.push(stem)
     }
     ids.sort()
     // Same list, same objects: reassigning the model would tear down every
@@ -95,22 +101,25 @@ Item {
   function recordsChanged() {
     dataRevision++
     scheduleLimitsRetry()
-    scheduleSync()
   }
 
-  // A collector that could not reach its limits endpoint at all — typically
-  // the seconds after login before the network is up — writes retryAdvised
-  // into its record. Honor it with one sooner try instead of waiting out the
-  // full refresh interval; a run that reaches the endpoint clears the flag.
-  // Only the advising agents rerun, so an outage at one provider does not
-  // put every other collector on a 30-second treadmill.
+  // A collector that could not reach its limits endpoint at all (typically
+  // the seconds after login, before the network is up) writes retryAdvised
+  // into its record. That earns a sooner try than the full refresh
+  // interval: 30 s, then 1, 2, 4... minutes while the outage lasts, so a
+  // long one never becomes a 30-second treadmill. Only the advising agents
+  // rerun. Sign-in problems never advise a retry; waiting does not fix them.
   property var retryAgentIds: []
+  property int retryStreak: 0
 
   Timer {
     id: limitsRetry
-    interval: 30000
+    interval: Math.min(root.refreshIntervalSec * 1000, 30000 * Math.pow(2, Math.min(root.retryStreak, 6)))
     repeat: false
-    onTriggered: root.runUpdate("limits", root.retryAgentIds)
+    onTriggered: {
+      root.retryStreak++
+      root.runUpdate("limits", root.retryAgentIds)
+    }
   }
 
   function scheduleLimitsRetry() {
@@ -121,13 +130,22 @@ Item {
         advising.push(String(record.id))
     }
     retryAgentIds = advising
-    if (advising.length > 0) limitsRetry.restart()
-    else limitsRetry.stop()
+    if (advising.length > 0 && leader()) {
+      if (!limitsRetry.running) limitsRetry.restart()
+    } else {
+      retryStreak = 0
+      limitsRetry.stop()
+    }
   }
 
-  Component.onCompleted: {
-    rescanAgents()
-    if (syncConfigured()) scheduleSync()
+  Component.onCompleted: rescanAgents()
+
+  // The first run waits a moment so sibling widgets on other bars have
+  // registered and the leader is settled.
+  Timer {
+    interval: 1500
+    running: true
+    onTriggered: if (root.leader()) root.runUpdate("normal")
   }
 
   // -------------------------------------------------------------- refresh
@@ -139,8 +157,7 @@ Item {
     interval: root.refreshIntervalSec * 1000
     running: true
     repeat: true
-    triggeredOnStart: true
-    onTriggered: root.runUpdate("normal")
+    onTriggered: if (root.leader()) root.runUpdate("normal")
   }
 
   Process {
@@ -170,15 +187,13 @@ Item {
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}
     for (var id in providers) {
-      if (providers[id] && providers[id].enabled === false
-          && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(id) && id.indexOf("..") < 0)
+      if (providers[id] && providers[id].enabled === false && U.safeId(id) !== "")
         command.push("--except", id)
     }
     if (agentIds) {
       for (var i = 0; i < agentIds.length; i++) {
-        var aid = String(agentIds[i] || "")
-        if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(aid) && aid.indexOf("..") < 0)
-          command.push(aid)
+        var aid = U.safeId(agentIds[i])
+        if (aid !== "") command.push(aid)
       }
     }
     return command
@@ -199,39 +214,25 @@ Item {
   function refreshAll(force) { runUpdate(force === true ? "force" : "normal") }
 
   // Opening the panel wants the numbers that go stale on the wire, not
-  // another walk over every transcript on disk — the collectors reuse their
+  // another walk over every transcript on disk: the collectors reuse their
   // recent scans in this mode.
   function refreshLimits() { runUpdate("limits") }
 
   // ------------------------------------------------------------- providers
 
   // An agent earns a place in the bar and the panel by being switched on in
-  // settings and having actually produced numbers — locally or on a synced
-  // device. With nothing to show, the whole module collapses out of the bar
-  // rather than sitting there dimmed.
+  // settings and having actually produced numbers. With nothing to show,
+  // the whole module collapses out of the bar rather than sitting there
+  // dimmed.
   property var enabledProviders: {
     var rev = dataRevision
-    var syncRev = syncRevision
     var result = []
-    var localIds = {}
     for (var i = 0; i < agents.length; i++) {
       var record = agents[i] ? agents[i].record : null
       if (!record || !record.id) continue
-      var id = String(record.id)
-      localIds[id] = true
-      if (!providerEnabled(id)) continue
-      var display = displayProvider(record)
-      if (providerHasData(display)) result.push(display)
-    }
-    // An agent that only ever ran on another machine has no local record, but
-    // its synced numbers still deserve a tab. Rate limits stay blank — they
-    // are per-account and never travel.
-    var syncedProviders = syncConfigured() && aggregateData && aggregateData.providers ? aggregateData.providers : {}
-    for (var syncedId in syncedProviders) {
-      if (localIds[syncedId] || !providerEnabled(syncedId)) continue
-      var stats = syncedProviders[syncedId] || {}
-      var syncedDisplay = displayProvider({ id: syncedId, name: stats.providerName || syncedId })
-      if (providerHasData(syncedDisplay)) result.push(syncedDisplay)
+      if (!providerEnabled(String(record.id))) continue
+      var display = U.displayProvider(record)
+      if (U.providerHasData(display)) result.push(display)
     }
     return result
   }
@@ -241,522 +242,8 @@ Item {
     return settings.providers[id].enabled !== false
   }
 
-  // All-time keeps a quiet day from hiding an agent; today's counts admit a
-  // machine whose only source is history.jsonl, which knows nothing older.
-  function providerHasData(p) {
-    return numberValue(p.totalPrompts) > 0 || numberValue(p.totalSessions) > 0
-      || numberValue(p.activeDays) > 0 || numberValue(p.todayPrompts) > 0
-      || numberValue(p.todaySessions) > 0 || (p.limits && p.limits.length > 0)
-      || !!p.balance
-  }
-
-  // A prepaid agent's credit ledger. Like rate limits, the balance is
-  // per-account and never merged across devices.
-  function balanceValue(raw) {
-    if (!raw || typeof raw !== "object") return null
-    var remaining = Number(raw.remaining)
-    var funded = Number(raw.funded)
-    if (!isFinite(remaining) || remaining < 0) return null
-    return {
-      remaining: remaining,
-      funded: isFinite(funded) && funded > 0 ? funded : 0,
-      spent: Math.max(0, Number(raw.spent) || 0),
-      currency: String(raw.currency || "USD"),
-      estimated: raw.estimated === true
-    }
-  }
-
-  function displayProvider(record) {
-    var stats = syncedStatsFor(String(record.id))
-    var synced = !!stats
-    var deviceCount = synced ? Number(stats.deviceCount || aggregateData.deviceCount || 0) : 0
-
-    return {
-      providerId: String(record.id),
-      providerName: String(record.name || record.id),
-      ready: record.ready === true || synced,
-      usageStatusText: String(record.usageStatusText || ""),
-      authHelpText: String(record.authHelpText || ""),
-
-      // Rate limits and balances stay per-account and are never merged
-      // across devices.
-      limits: Array.isArray(record.limits) ? record.limits : [],
-      // Set when the limits are a cached copy shown under a status (sign-in
-      // expired, API down): the panel says how old they are.
-      limitsAsOf: String(record.limitsAsOf || ""),
-      tierLabel: String(record.tierLabel || ""),
-      balance: balanceValue(record.balance),
-
-      todayPrompts: synced ? numberValue(stats.todayPrompts) : numberValue(record.todayPrompts),
-      todaySessions: synced ? numberValue(stats.todaySessions) : numberValue(record.todaySessions),
-      todayTotalTokens: synced ? numberValue(stats.todayTotalTokens) : numberValue(record.todayTotalTokens),
-      todayTokensByModel: synced ? (stats.todayTokensByModel || ({})) : (record.todayTokensByModel || ({})),
-      recentDays: synced ? (stats.recentDays || []) : (record.recentDays || []),
-      totalPrompts: synced ? numberValue(stats.totalPrompts) : numberValue(record.totalPrompts),
-      totalSessions: synced ? numberValue(stats.totalSessions) : numberValue(record.totalSessions),
-      activeDays: synced ? numberValue(stats.activeDays) : numberValue(record.activeDays),
-      modelUsage: synced ? (stats.modelUsage || ({})) : (record.modelUsage || ({})),
-      hasLocalStats: synced ? (stats.hasLocalStats !== false) : (record.hasLocalStats !== false),
-      hasPromptStats: synced ? (stats.hasPromptStats !== false) : (record.hasPromptStats !== false),
-
-      // Hermes-only control data: recent sessions, gateway, cron, pause.
-      hermes: hermesInfo(record.hermes),
-
-      syncEnabled: synced,
-      syncDeviceCount: deviceCount,
-      syncUpdatedAt: aggregateData && aggregateData.updatedAt ? aggregateData.updatedAt : ""
-    }
-  }
-
-  // The record is a file on disk, so every field the panel acts on is
-  // re-checked here: session ids reach an argv, titles reach text sinks.
-  function hermesInfo(raw) {
-    if (!raw || typeof raw !== "object") return null
-    var sessions = []
-    var list = Array.isArray(raw.recentSessions) ? raw.recentSessions.slice(0, 6) : []
-    for (var i = 0; i < list.length; i++) {
-      var s = list[i]
-      if (!s || typeof s !== "object") continue
-      var id = String(s.id || "")
-      if (!/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(id)) continue
-      var source = String(s.source || "")
-      sessions.push({
-        id: id,
-        title: String(s.title || "Untitled session").substring(0, 80),
-        source: /^[a-z][a-z0-9_-]{0,31}$/.test(source) ? source : "cli",
-        model: String(s.model || "").substring(0, 64),
-        messages: numberValue(s.messages),
-        lastActivityAt: String(s.lastActivityAt || "").substring(0, 40),
-        open: s.open === true,
-        pinned: s.pinned === true,
-        costUsd: moneyValue(s.costUsd)
-      })
-    }
-    var gateway = raw.gateway && typeof raw.gateway === "object" ? raw.gateway : {}
-    var cron = raw.cron && typeof raw.cron === "object" ? raw.cron : {}
-    var ended = raw.lastEnded && typeof raw.lastEnded === "object" ? raw.lastEnded : {}
-    var endReason = String(ended.reason || "")
-    return {
-      sessions: sessions,
-      gatewayRunning: String(gateway.state || "") === "running",
-      activeAgents: numberValue(gateway.activeAgents),
-      paused: raw.paused === true,
-      cronJobs: numberValue(cron.jobs),
-      cronActive: numberValue(cron.active),
-      cronFailing: numberValue(cron.failing),
-      cronNextRunAt: String(cron.nextRunAt || "").substring(0, 40),
-      todayCostUsd: moneyValue(raw.todayCostUsd),
-      weekCostUsd: moneyValue(raw.weekCostUsd),
-      runningWorkers: numberValue(raw.runningWorkers),
-      lastEndReason: /^[a-z][a-z0-9_]{0,39}$/.test(endReason) ? endReason : "",
-      lastEndedAt: String(ended.at || "").substring(0, 40)
-    }
-  }
-
-  function moneyValue(value) {
-    var n = Number(value)
-    return isFinite(n) && n >= 0 ? n : 0
-  }
-
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
-  }
-
-  // ------------------------------------------------------------------ sync
-
-  property var syncModeSetting: setting("syncMode", setting("syncEnabled", false))
-  property bool syncEnabled: parseSyncEnabled(syncModeSetting)
-  property string syncDir: String(setting("syncDir", ""))
-  property string syncFileName: String(setting("syncFileName", ""))
-  property string syncDeviceId: String(setting("syncDeviceId", ""))
-  property string detectedHostname: ""
-  readonly property string syncEffectiveDir: expandPath(syncDir)
-  readonly property string syncEffectiveFileName: safeSnapshotFileName(syncFileName, syncDeviceId)
-  readonly property string syncEffectiveDeviceId: safeDeviceId(syncDeviceId || syncEffectiveFileName.replace(/\.json$/i, ""))
-  readonly property string syncSnapshotPath: syncConfigured() ? syncEffectiveDir + "/" + syncEffectiveFileName : home + "/.cache/omarchy/agents-disabled.json"
-  property var aggregateData: ({})
-  property int syncRevision: 0
-  property bool syncRunning: false
-  property bool syncRequestedWhileRunning: false
-  property string syncStatusText: ""
-  property double aggregateUpdatedAtMs: aggregateData && aggregateData.updatedAtMs ? Number(aggregateData.updatedAtMs) : 0
-
-  onSyncEnabledChanged: syncSettingsChanged()
-  onSyncDirChanged: syncSettingsChanged()
-  onSyncFileNameChanged: if (syncConfigured()) scheduleSync()
-  onSyncDeviceIdChanged: if (syncConfigured()) scheduleSync()
-
-  Timer {
-    id: syncDebounce
-    interval: 1000
-    repeat: false
-    onTriggered: root.runSync()
-  }
-
-  // Cross-device snapshot merge is omitted: concatenating JSON from a
-  // user-chosen folder inside the shell is not a boundary this fork will
-  // take. Settings keys remain so an existing shell.json does not break.
-  function runSync() {
-    return
-  }
-
-  function writeSyncSnapshot() {
-    return
-  }
-
-  function startSyncScan() {
-    return
-  }
-
-  function parseSyncEnabled(value) {
-    if (value === true) return true
-    var text = String(value || "").trim().toLowerCase()
-    return text === "on" || text === "enabled" || text === "true" || text === "yes" || text === "1"
-  }
-
-  function syncConfigured() {
-    return root.syncEnabled === true && String(root.syncDir || "").trim() !== ""
-  }
-
-  function syncSettingsChanged() {
-    if (syncConfigured()) {
-      scheduleSync()
-    } else {
-      syncDebounce.stop()
-      syncRequestedWhileRunning = false
-      aggregateData = ({})
-      syncStatusText = ""
-      syncRevision++
-    }
-  }
-
-  function scheduleSync() {
-    return
-  }
-
-  function finishSyncRun() {
-    if (syncRequestedWhileRunning && syncConfigured()) {
-      syncRequestedWhileRunning = false
-      scheduleSync()
-    }
-  }
-
-  function expandPath(path) {
-    var value = String(path || "").trim()
-    if (value === "") return ""
-    if (value === "~") return home
-    if (value.indexOf("~/") === 0) return home + value.substring(1)
-    if (value.indexOf("$HOME/") === 0) return home + value.substring(5)
-    if (value.charAt(0) !== "/") return home + "/" + value
-    return value
-  }
-
-  function safeDeviceId(raw) {
-    var value = String(raw || "").trim()
-    if (value === "") value = Quickshell.env("HOSTNAME") || root.detectedHostname || Quickshell.env("HOST") || Quickshell.env("USER") || "device"
-    value = value.replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "")
-    if (value === "") value = "device"
-    return value.length > 80 ? value.substring(0, 80) : value
-  }
-
-  function safeSnapshotFileName(rawFileName, rawDeviceId) {
-    var value = String(rawFileName || "").trim()
-    if (value === "") value = safeDeviceId(rawDeviceId) + ".json"
-    value = value.split("/").pop().replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "")
-    if (value === "") value = safeDeviceId(rawDeviceId) + ".json"
-    if (!/\.json$/i.test(value)) value += ".json"
-    return value.length > 100 ? value.substring(0, 95) + ".json" : value
-  }
-
-  function parseSyncScanOutput(output) {
-    var lines = String(output || "").split("\n")
-    var snapshots = []
-    var currentPath = ""
-    var currentJson = []
-
-    function flush() {
-      if (currentPath === "") return
-      var raw = currentJson.join("\n").trim()
-      try {
-        var parsed = JSON.parse(raw)
-        if (parsed && parsed.providers) snapshots.push(parsed)
-      } catch (e) {
-        console.warn("agents/sync", "Ignoring bad snapshot", currentPath, e)
-      }
-      currentPath = ""
-      currentJson = []
-    }
-
-    for (var i = 0; i < lines.length; i++) {
-      var line = lines[i]
-      var start = line.match(/^===(.+)===$/)
-      if (start && line !== "=== EOM ===") {
-        flush()
-        currentPath = start[1]
-        currentJson = []
-        continue
-      }
-      if (line === "=== EOM ===") {
-        flush()
-        continue
-      }
-      if (currentPath !== "") currentJson.push(line)
-    }
-    flush()
-
-    aggregateData = aggregateSnapshots(snapshots)
-    syncStatusText = ""
-    syncRevision++
-  }
-
-  function cloneValue(value, fallback) {
-    if (value === undefined || value === null) return fallback
-    try {
-      return JSON.parse(JSON.stringify(value))
-    } catch (e) {
-      return fallback
-    }
-  }
-
-  function numberValue(value) {
-    var n = Number(value || 0)
-    return isFinite(n) ? Math.round(n) : 0
-  }
-
-  function dateString(date) {
-    var y = date.getFullYear()
-    var m = String(date.getMonth() + 1).padStart(2, "0")
-    var d = String(date.getDate()).padStart(2, "0")
-    return y + "-" + m + "-" + d
-  }
-
-  function recentDateStrings() {
-    var result = []
-    for (var offset = 6; offset >= 0; offset--) {
-      var date = new Date()
-      date.setDate(date.getDate() - offset)
-      result.push(dateString(date))
-    }
-    return result
-  }
-
-  function emptyTokenBucket() {
-    return { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }
-  }
-
-  // Device-scoped stats add up across machines; account-scoped stats
-  // (Fireworks' billing API) are replicas of the same upstream truth on
-  // every synced device, so the widest value wins — summing them would
-  // double every token per machine.
-  function combineNumber(additive, current, value) {
-    return additive ? numberValue(current) + numberValue(value) : Math.max(numberValue(current), numberValue(value))
-  }
-
-  function combineObjectNumbers(additive, target, source) {
-    if (!source) return
-    for (var key in source) target[key] = combineNumber(additive, target[key], source[key])
-  }
-
-  function aggregateSnapshots(snapshots) {
-    var dates = recentDateStrings()
-    var devices = {}
-    var providers = {}
-
-    function providerAcc(id) {
-      if (providers[id]) return providers[id]
-      var recentByDay = {}
-      for (var d = 0; d < dates.length; d++) recentByDay[dates[d]] = 0
-      providers[id] = {
-        providerId: id,
-        providerName: "",
-        ready: false,
-        hasLocalStats: false,
-        hasPromptStats: false,
-        todayPrompts: 0,
-        todaySessions: 0,
-        todayTotalTokens: 0,
-        todayTokensByModel: ({}),
-        recentByDay: recentByDay,
-        totalPrompts: 0,
-        totalSessions: 0,
-        activeDays: 0,
-        activeDates: ({}),
-        modelUsage: ({}),
-        devices: ({})
-      }
-      return providers[id]
-    }
-
-    for (var i = 0; i < snapshots.length; i++) {
-      var snapshot = snapshots[i]
-      var device = safeDeviceId(snapshot.deviceId || "device")
-      devices[device] = true
-      var snapshotProviders = snapshot.providers || {}
-      for (var providerId in snapshotProviders) {
-        var stats = snapshotProviders[providerId] || {}
-        var acc = providerAcc(String(providerId))
-        acc.devices[device] = true
-        if (stats.providerName && acc.providerName === "") acc.providerName = String(stats.providerName)
-        acc.ready = acc.ready || stats.ready === true
-        acc.hasLocalStats = acc.hasLocalStats || stats.hasLocalStats !== false
-        // Snapshots from before the field existed only came from agents that
-        // count prompts, so a missing value reads as true.
-        acc.hasPromptStats = acc.hasPromptStats || stats.hasPromptStats !== false
-        var additive = String(stats.scope || "device") !== "account"
-        acc.todayPrompts = combineNumber(additive, acc.todayPrompts, stats.todayPrompts)
-        acc.todaySessions = combineNumber(additive, acc.todaySessions, stats.todaySessions)
-        acc.todayTotalTokens = combineNumber(additive, acc.todayTotalTokens, stats.todayTotalTokens)
-        acc.totalPrompts = combineNumber(additive, acc.totalPrompts, stats.totalPrompts)
-        acc.totalSessions = combineNumber(additive, acc.totalSessions, stats.totalSessions)
-        // Active days overlap between machines, so union the dates rather than
-        // summing counts. Snapshots written before activeDates existed only
-        // carry a count; the widest one stands in for them.
-        var activeDates = Array.isArray(stats.activeDates) ? stats.activeDates : []
-        for (var ad = 0; ad < activeDates.length; ad++) acc.activeDates[String(activeDates[ad])] = true
-        acc.activeDays = Math.max(acc.activeDays, numberValue(stats.activeDays))
-        combineObjectNumbers(additive, acc.todayTokensByModel, stats.todayTokensByModel || {})
-
-        var recent = Array.isArray(stats.recentDays) ? stats.recentDays : []
-        for (var r = 0; r < recent.length; r++) {
-          var day = recent[r] || {}
-          var date = String(day.date || "")
-          if (acc.recentByDay[date] !== undefined)
-            acc.recentByDay[date] = combineNumber(additive, acc.recentByDay[date], day.messageCount)
-        }
-
-        var usage = stats.modelUsage || {}
-        for (var modelId in usage) {
-          var bucket = acc.modelUsage[modelId]
-          if (!bucket) bucket = acc.modelUsage[modelId] = emptyTokenBucket()
-          combineObjectNumbers(additive, bucket, usage[modelId] || {})
-        }
-      }
-    }
-
-    var outProviders = {}
-    for (var id in providers) {
-      var acc = providers[id]
-      var recentDays = []
-      for (var di = 0; di < dates.length; di++) recentDays.push({ date: dates[di], messageCount: acc.recentByDay[dates[di]] || 0 })
-      var providerDevices = Object.keys(acc.devices).sort()
-      outProviders[id] = {
-        providerId: acc.providerId,
-        providerName: acc.providerName,
-        ready: acc.ready || providerDevices.length > 0,
-        hasLocalStats: acc.hasLocalStats,
-        hasPromptStats: acc.hasPromptStats,
-        todayPrompts: acc.todayPrompts,
-        todaySessions: acc.todaySessions,
-        todayTotalTokens: acc.todayTotalTokens,
-        todayTokensByModel: acc.todayTokensByModel,
-        recentDays: recentDays,
-        totalPrompts: acc.totalPrompts,
-        totalSessions: acc.totalSessions,
-        activeDays: Math.max(acc.activeDays, Object.keys(acc.activeDates).length),
-        modelUsage: acc.modelUsage,
-        deviceCount: providerDevices.length,
-        devices: providerDevices
-      }
-    }
-
-    return {
-      schemaVersion: 1,
-      updatedAt: new Date().toISOString(),
-      updatedAtMs: Date.now(),
-      deviceCount: Object.keys(devices).length,
-      devices: Object.keys(devices).sort(),
-      providers: outProviders
-    }
-  }
-
-  // Snapshots keep the field names older Omarchy versions wrote, so a fleet
-  // of machines on mixed versions still merges cleanly in both directions.
-  function providerSnapshot(record) {
-    return {
-      providerId: String(record.id),
-      providerName: String(record.name || record.id),
-      ready: record.ready === true,
-      hasLocalStats: record.hasLocalStats !== false,
-      hasPromptStats: record.hasPromptStats !== false,
-      scope: String(record.scope || "device"),
-      todayPrompts: numberValue(record.todayPrompts),
-      todaySessions: numberValue(record.todaySessions),
-      todayTotalTokens: numberValue(record.todayTotalTokens),
-      todayTokensByModel: cloneValue(record.todayTokensByModel, ({})),
-      recentDays: cloneValue(record.recentDays, []),
-      totalPrompts: numberValue(record.totalPrompts),
-      totalSessions: numberValue(record.totalSessions),
-      activeDays: numberValue(record.activeDays),
-      activeDates: cloneValue(record.activeDates, []),
-      modelUsage: cloneValue(record.modelUsage, ({}))
-    }
-  }
-
-  function localSnapshot() {
-    var providerMap = {}
-    for (var i = 0; i < agents.length; i++) {
-      var record = agents[i] ? agents[i].record : null
-      if (!record || !record.id) continue
-      if (!providerEnabled(String(record.id))) continue
-      providerMap[String(record.id)] = providerSnapshot(record)
-    }
-    return {
-      schemaVersion: 1,
-      deviceId: syncEffectiveDeviceId,
-      updatedAt: new Date().toISOString(),
-      providers: providerMap
-    }
-  }
-
-  function syncedStatsFor(providerId) {
-    var rev = syncRevision
-    if (!syncConfigured() || !aggregateData || !aggregateData.providers) return null
-    return aggregateData.providers[providerId] || null
-  }
-
-  // ---------------------------------------------------------------- format
-
-  function formatTokenCount(n) {
-    if (n === undefined || n === null) return "0"
-    if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
-    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K"
-    return String(n)
-  }
-
-  function modelWordCase(word) {
-    if (word === "gpt") return "GPT"
-    if (word === "deepseek") return "DeepSeek"
-    return word.charAt(0).toUpperCase() + word.slice(1)
-  }
-
-  // Model ids arrive hyphenated with the version split across segments
-  // (`claude-opus-4-8`, `gpt-5.6-sol`). Rejoin the numeric run into one
-  // version and title-case the words around it.
-  function friendlyModelName(id) {
-    if (!id) return "Unknown"
-    var name = String(id)
-    var slash = name.lastIndexOf("/")
-    if (slash >= 0) name = name.slice(slash + 1)
-    name = name.replace(/^claude-/, "").replace(/-\d{8}$/, "").replace(/:/g, "-")
-    var parts = name.split("-")
-    var words = []
-    var version = []
-    for (var i = 0; i < parts.length; i++) {
-      var part = parts[i]
-      if (part === "") continue
-      if (/^\d/.test(part)) {
-        version.push(part)
-        continue
-      }
-      if (version.length > 0) {
-        words.push(version.join("."))
-        version = []
-      }
-      words.push(modelWordCase(part))
-    }
-    if (version.length > 0) words.push(version.join("."))
-    return words.length > 0 ? words.join(" ") : "Unknown"
   }
 }

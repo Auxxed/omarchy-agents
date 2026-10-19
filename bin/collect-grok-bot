@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 # omarchy:summary=Print the Grok Bot usage record as JSON
 # omarchy:args=[--force] [--limits-only]
 # omarchy:hidden=true
@@ -8,6 +8,11 @@ Grok Bot's allowance is separate from SuperGrok Chat/Build. It lives on
 Cursor's sand API. Credentials come from the Grok Bot app
 (~/.config/Grok Bot/sand-secrets.json) or a Cursor CLI login
 (~/.cursor/auth.json). The token is only sent as an HTTP header.
+
+Those logins belong to their apps: this collector only reads them. It never
+renews a token itself, because a renewal can retire the refresh token the
+app holds and sign the app out. An expired token reads as "Sign-in
+expired" until the app renews its own.
 """
 
 from __future__ import annotations
@@ -34,11 +39,13 @@ from typing import Any
 AGENT_ID = "grok-bot"
 AGENT_NAME = "Grok Bot"
 AUTH_HELP = "Sign in to the Grok Bot app, or Cursor, to read the weekly Grok Bot pool."
+EXPIRED_HELP = "Open the Grok Bot app once; it renews its own sign-in."
 CURSOR_HOST = "api2.cursor.sh"
 SAND_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus"
-CURSOR_TOKEN_URL = "https://api2.cursor.sh/oauth/token"
-CURSOR_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
 MAX_SECRET_BYTES = 262144
+MAX_CACHE_BYTES = 1_048_576
+# After an HTTP 429 the sand API is left alone this long.
+RATE_LIMIT_SECONDS = 300
 MAX_HTTP_BYTES = 1_048_576
 HTTP_TIMEOUT = 12
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
@@ -49,9 +56,17 @@ def grok_bot_dir() -> Path:
 
 
 def cache_root() -> Path:
-    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    """The shared agent-usage cache, 0700. A link or someone else's directory
+    at that path is refused rather than written through."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    root = os.path.join(base, "omarchy", "agent-usage")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise PermissionError(f"{root} is not a private directory")
+    if st.st_mode & 0o077:
+        os.chmod(root, 0o700)
+    return Path(root)
 
 
 def read_bounded_json(path: Path, max_bytes: int) -> dict[str, Any] | None:
@@ -83,15 +98,21 @@ def read_bounded_json(path: Path, max_bytes: int) -> dict[str, Any] | None:
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
-    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    tmp = Path(tmp_name)
+    """Atomically replace path with payload, 0600 from the first byte. The
+    rename replaces a link planted at path instead of writing through it."""
+    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
     try:
+        os.fchmod(handle_fd, 0o600)
         with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
-        tmp.chmod(0o600)
-        tmp.replace(path)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
         raise
 
 
@@ -193,26 +214,26 @@ def decrypt_grok_bot_secret(blob_b64: str) -> str | None:
     return None
 
 
-def grok_bot_tokens() -> tuple[str | None, str | None]:
+def grok_bot_access_token() -> str | None:
+    """The Grok Bot app's access token for its active account."""
     secrets = read_bounded_json(grok_bot_dir() / "sand-secrets.json", MAX_SECRET_BYTES)
     if not secrets:
-        return None, None
+        return None
     try:
         accounts = json.loads(str(secrets.get("cursor-accounts") or "{}"))
-    except (TypeError, json.JSONDecodeError):
-        return None, None
+    except (TypeError, ValueError, RecursionError):
+        return None
     if not isinstance(accounts, dict):
-        return None, None
+        return None
     active = accounts.get("active")
-    bucket = (accounts.get("accounts") or {}).get(active) if active else None
+    listed = accounts.get("accounts") if isinstance(accounts.get("accounts"), dict) else {}
+    bucket = listed.get(active) if isinstance(active, str) else None
     if not isinstance(bucket, dict):
-        return None, None
-    access = decrypt_grok_bot_secret(str(bucket.get("cursor-access-token") or ""))
-    refresh = decrypt_grok_bot_secret(str(bucket.get("cursor-refresh-token") or ""))
-    return access, refresh
+        return None
+    return decrypt_grok_bot_secret(str(bucket.get("cursor-access-token") or ""))
 
 
-def cursor_auth_file_tokens() -> tuple[str | None, str | None]:
+def cursor_auth_file_access_token() -> str | None:
     for path in (
         Path.home() / ".config" / "cursor" / "auth.json",
         Path.home() / ".cursor" / "auth.json",
@@ -221,9 +242,8 @@ def cursor_auth_file_tokens() -> tuple[str | None, str | None]:
         if not data:
             continue
         access = data.get("accessToken") or data.get("access_token")
-        refresh = data.get("refreshToken") or data.get("refresh_token")
-        return (str(access) if access else None, str(refresh) if refresh else None)
-    return None, None
+        return str(access) if access else None
+    return None
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -302,35 +322,21 @@ def cursor_rpc(method: str, token: str, payload: dict[str, Any] | None = None) -
     )
 
 
-def cursor_refresh(refresh_token: str) -> str | None:
-    body = json.dumps({
-        "client_id": CURSOR_CLIENT_ID,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }).encode()
-    status, payload = http_json(
-        CURSOR_TOKEN_URL,
-        method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        data=body,
-    )
-    if status != 200:
-        return None
-    access = payload.get("access_token") or payload.get("accessToken")
-    return str(access) if access else None
-
-
 def usable_cursor_token() -> str | None:
-    access, refresh = grok_bot_tokens()
-    if not access:
-        access, refresh = cursor_auth_file_tokens()
-    if access and jwt_expired(access) and refresh:
-        rotated = cursor_refresh(refresh)
-        if rotated:
-            access = rotated
+    """The app's current access token while it is still valid. Only the
+    access half is read; the refresh token stays the app's business."""
+    access = grok_bot_access_token() or cursor_auth_file_access_token()
     if access and jwt_expired(access, skew_seconds=0):
         return None
     return access
+
+
+def number(value: Any) -> int:
+    try:
+        n = float(value or 0)
+        return round(n) if n == n and abs(n) < 1e15 else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def usage_percent(value: Any) -> float:
@@ -396,8 +402,11 @@ def collect_limits(force: bool) -> dict[str, Any]:
         "usageStatusText": "",
         "authHelpText": AUTH_HELP,
     }
-    cache_file = cache_root() / "grok-bot-limits.json"
-    cached = read_bounded_json(cache_file, MAX_SECRET_BYTES) or {}
+    try:
+        cache_file: Path | None = cache_root() / "grok-bot-limits.json"
+    except OSError:
+        cache_file = None
+    cached = (read_bounded_json(cache_file, MAX_CACHE_BYTES) if cache_file else None) or {}
     fallback = cached.get("limits") if isinstance(cached.get("limits"), list) else []
     fallback_tier = str(cached.get("tierLabel") or "")
 
@@ -410,11 +419,19 @@ def collect_limits(force: bool) -> dict[str, Any]:
         result["limits"] = fallback
         result["tierLabel"] = fallback_tier
         result["usageStatusText"] = "Sign-in expired"
-        result["retryAdvised"] = True
+        result["authHelpText"] = EXPIRED_HELP
+        return result
+
+    backoff_until = number(cached.get("backoffUntilMs")) / 1000.0
+    if backoff_until > time.time():
+        result["limits"] = fallback
+        result["tierLabel"] = fallback_tier
+        result["authHelpText"] = ""
+        result["usageStatusText"] = f"Rate limited, next try in {max(1, round((backoff_until - time.time()) / 60))}m"
         return result
 
     if not force:
-        fetched_at = float(cached.get("fetchedAtMs") or 0) / 1000.0
+        fetched_at = number(cached.get("fetchedAtMs")) / 1000.0
         if fetched_at and 0 <= time.time() - fetched_at < 15 and fallback:
             result["limits"] = fallback
             result["tierLabel"] = fallback_tier
@@ -428,10 +445,22 @@ def collect_limits(force: bool) -> dict[str, Any]:
         result["usageStatusText"] = "Grok Bot limits unavailable"
         result["retryAdvised"] = True
         return result
+    if status == 429:
+        if cache_file is not None:
+            try:
+                write_json(cache_file, {**cached, "backoffUntilMs": round((time.time() + RATE_LIMIT_SECONDS) * 1000)})
+            except OSError:
+                pass
+        result["limits"] = fallback
+        result["tierLabel"] = fallback_tier
+        result["authHelpText"] = ""
+        result["usageStatusText"] = f"Rate limited, next try in {RATE_LIMIT_SECONDS // 60}m"
+        return result
     if status in (401, 403):
         result["limits"] = fallback
         result["tierLabel"] = fallback_tier
         result["usageStatusText"] = "Sign-in expired"
+        result["authHelpText"] = EXPIRED_HELP
         return result
     if status != 200:
         result["limits"] = fallback
@@ -462,14 +491,15 @@ def collect_limits(force: bool) -> dict[str, Any]:
         result["limits"] = []
         result["usageStatusText"] = "No Grok Bot allowance"
         result["authHelpText"] = "This login has no included Grok Bot weekly pool."
-    try:
-        write_json(cache_file, {
-            "fetchedAtMs": round(time.time() * 1000),
-            "limits": result["limits"],
-            "tierLabel": result["tierLabel"],
-        })
-    except Exception:
-        pass
+    if cache_file is not None:
+        try:
+            write_json(cache_file, {
+                "fetchedAtMs": round(time.time() * 1000),
+                "limits": result["limits"],
+                "tierLabel": result["tierLabel"],
+            })
+        except OSError:
+            pass
     return result
 
 

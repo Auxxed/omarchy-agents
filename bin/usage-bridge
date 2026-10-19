@@ -1,8 +1,10 @@
 #!/usr/bin/python3 -I
-"""Bounded list/read/write for agent usage records and optional sync snapshots.
+"""Bounded list/read of agent usage records for the panel.
 
 Invoked as an argv array from QML. Never follows the final pathname: every
 open is O_NOFOLLOW|O_NONBLOCK on a descriptor, then fstat, then a cap+1 read.
+Every record is rebuilt field by field before the shell sees it, so a
+record with junk in it reads as junk-free, never as a crash.
 """
 
 from __future__ import annotations
@@ -16,8 +18,6 @@ from typing import Any
 
 MAX_RECORD = 262144
 MAX_LIST = 32
-MAX_SYNC_FILES = 32
-MAX_NAME = 64
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_STR = 240
 MAX_LIMITS = 8
@@ -134,26 +134,30 @@ def clip_str(value: Any, n: int = MAX_STR) -> str:
     return s
 
 
+def finite(value: Any) -> float | None:
+    """A real, finite number, or None. Booleans and strings are not numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    n = float(value)
+    return n if n == n and n not in (float("inf"), float("-inf")) else None
+
+
 def clip_num(value: Any) -> int:
-    try:
-        n = float(value or 0)
-    except (TypeError, ValueError):
+    n = finite(value)
+    if n is None or n < 0:
         return 0
-    if n != n or n < 0:
-        return 0
-    return min(10**12, round(n))
+    return round(min(1e12, n))
 
 
 HERMES_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 HERMES_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+HERMES_END_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 MAX_HERMES_SESSIONS = 6
 
 
 def clip_money(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0.0
-    n = float(value)
-    return n if n == n and 0 <= n < 1e9 else 0.0
+    n = finite(value)
+    return n if n is not None and 0 <= n < 1e9 else 0.0
 
 
 def sanitize_hermes(raw: Any) -> dict[str, Any] | None:
@@ -182,6 +186,9 @@ def sanitize_hermes(raw: Any) -> dict[str, Any] | None:
         })
     gateway = raw.get("gateway") if isinstance(raw.get("gateway"), dict) else {}
     cron = raw.get("cron") if isinstance(raw.get("cron"), dict) else {}
+    ended = raw.get("lastEnded") if isinstance(raw.get("lastEnded"), dict) else {}
+    reason = ended.get("reason")
+    ended_at = ended.get("at")
     return {
         "recentSessions": sessions,
         "gateway": {
@@ -197,25 +204,27 @@ def sanitize_hermes(raw: Any) -> dict[str, Any] | None:
         },
         "todayCostUsd": clip_money(raw.get("todayCostUsd")),
         "weekCostUsd": clip_money(raw.get("weekCostUsd")),
+        "runningWorkers": min(clip_num(raw.get("runningWorkers")), 10_000),
+        "lastEnded": {
+            "reason": reason if isinstance(reason, str) and HERMES_END_REASON_RE.fullmatch(reason) else "",
+            "at": ended_at if isinstance(ended_at, str) and ISO_TIME_RE.fullmatch(ended_at) else "",
+        },
     }
 
 
 def sanitize_record(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    rid = clip_str(raw.get("id"), MAX_NAME)
-    if not ID_RE.fullmatch(rid):
+    rid = raw.get("id")
+    if not isinstance(rid, str) or not ID_RE.fullmatch(rid):
         return None
     limits_in = raw.get("limits") if isinstance(raw.get("limits"), list) else []
     limits = []
     for entry in limits_in[:MAX_LIMITS]:
         if not isinstance(entry, dict):
             continue
-        try:
-            percent = float(entry.get("percent"))
-        except (TypeError, ValueError):
-            continue
-        if percent != percent or percent < 0:
+        percent = finite(entry.get("percent"))
+        if percent is None or percent < 0:
             continue
         limits.append({
             "label": clip_str(entry.get("label"), 80),
@@ -248,20 +257,22 @@ def sanitize_record(raw: Any) -> dict[str, Any] | None:
     for i, (key, value) in enumerate(src.items()):
         if i >= MAX_MODELS:
             break
-        today_models[clip_str(key, 80)] = clip_num(value)
+        mk = clip_str(key, 80)
+        if mk:
+            today_models[mk] = clip_num(value)
     balance = None
     raw_bal = raw.get("balance")
     if isinstance(raw_bal, dict):
-        remaining = float(raw_bal.get("remaining") or 0)
-        funded = float(raw_bal.get("funded") or 0)
-        if remaining == remaining and remaining >= 0:
+        remaining = finite(raw_bal.get("remaining"))
+        if remaining is not None and 0 <= remaining < 1e9:
             balance = {
                 "remaining": remaining,
-                "funded": funded if funded == funded and funded >= 0 else 0,
-                "spent": float(raw_bal.get("spent") or 0) if isinstance(raw_bal.get("spent"), (int, float)) else 0,
+                "funded": clip_money(raw_bal.get("funded")),
+                "spent": clip_money(raw_bal.get("spent")),
                 "currency": clip_str(raw_bal.get("currency") or "USD", 8),
                 "estimated": raw_bal.get("estimated") is True,
             }
+    dates_in = raw.get("activeDates") if isinstance(raw.get("activeDates"), list) else []
     out = {
         "schemaVersion": 1,
         "id": rid,
@@ -281,7 +292,7 @@ def sanitize_record(raw: Any) -> dict[str, Any] | None:
         "totalPrompts": clip_num(raw.get("totalPrompts")),
         "totalSessions": clip_num(raw.get("totalSessions")),
         "activeDays": clip_num(raw.get("activeDays")),
-        "activeDates": [clip_str(d, 16) for d in (raw.get("activeDates") or [])[:366] if isinstance(d, str)],
+        "activeDates": [clip_str(d, 16) for d in dates_in[:366] if isinstance(d, str)],
         "modelUsage": models,
         "retryAdvised": raw.get("retryAdvised") is True,
         # Set when the limits are a cached copy served under a status.
@@ -302,6 +313,8 @@ def cmd_list() -> None:
         dirfd = usage_dirfd(create=False)
     except FileNotFoundError:
         return
+    except PermissionError as exc:
+        fail(4, str(exc))
     try:
         ids = []
         with os.scandir(dirfd) as entries:
@@ -330,18 +343,24 @@ def cmd_list() -> None:
 def cmd_read(agent_id: str) -> None:
     if not ID_RE.fullmatch(agent_id):
         fail(2, "bad id")
-    dirfd = usage_dirfd(create=False)
+    try:
+        dirfd = usage_dirfd(create=False)
+    except FileNotFoundError:
+        return
+    except PermissionError as exc:
+        fail(4, str(exc))
     try:
         raw = read_bounded(dirfd, agent_id + ".json", MAX_RECORD)
-    except FileNotFoundError:
-        raise SystemExit(0)
+    except OSError as exc:
+        # A link (ELOOP), a FIFO, someone else's file, or one too big.
+        fail(4, f"refusing {agent_id}.json: {exc.strerror or exc}")
     finally:
         os.close(dirfd)
     if raw is None:
         return
     try:
         parsed = json.loads(raw.decode("utf-8"))
-    except Exception:
+    except (ValueError, RecursionError):
         fail(4, "invalid json")
     record = sanitize_record(parsed)
     if record is None:
@@ -349,14 +368,9 @@ def cmd_read(agent_id: str) -> None:
     sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
-def cmd_hostname() -> None:
-    name = os.uname().nodename.strip() or "device"
-    sys.stdout.write(re.sub(r"[^A-Za-z0-9_.-]+", "-", name)[:80] + "\n")
-
-
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
-        fail(2, "usage: usage-bridge list|read|hostname <id>")
+        fail(2, "usage: usage-bridge list|read <id>")
     op = argv[1]
     if op == "list":
         cmd_list()
@@ -365,9 +379,6 @@ def main(argv: list[str]) -> int:
         if len(argv) < 3:
             fail(2, "read needs an id")
         cmd_read(argv[2])
-        return 0
-    if op == "hostname":
-        cmd_hostname()
         return 0
     fail(2, "unknown op")
     return 2
